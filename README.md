@@ -26,13 +26,21 @@ playwright install chromium
 cp .env.example .env
 ```
 
-編輯 `.env`，填入以下兩個值：
+編輯 `.env`，填入 Telegram 資訊，並設定要監控的票種：
 
 ```
 TELEGRAM_BOT_TOKEN=你的 Bot Token
 TELEGRAM_CHAT_ID=你的 Chat ID
 CHECK_INTERVAL=60
+
+TARGET_1_NAME=一樓內野區
+TARGET_1_URL=https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q
+
+TARGET_2_NAME=三樓外野區
+TARGET_2_URL=https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=xxxxxxxx
 ```
+
+每個票種或區域用一組 `TARGET_N_NAME` + `TARGET_N_URL` 定義，數字從 1 開始連續編號，可新增任意數量。
 
 ---
 

@@ -1,0 +1,18 @@
+services:
+  - type: worker
+    name: tickets-monitor
+    runtime: docker
+    plan: starter
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHAT_ID
+        sync: false
+      - key: CHECK_INTERVAL
+        value: "60"
+      - key: TARGET_URL
+        value: "https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q"
+      - key: EVENT_NAME
+        value: "Guardians UTK0204"
+      - key: WATCH_ZONES
+        value: ""

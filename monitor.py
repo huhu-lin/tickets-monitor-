@@ -90,43 +90,41 @@ def send_telegram(message: str) -> None:
         print(f"[WARN] 發送 Telegram 通知失敗：{e}")
 
 
-async def check_page() -> tuple[list[dict], list[str]]:
+async def check_page(browser) -> tuple[list[dict], list[str]]:
     """
     Load the ticket page and extract per-zone availability.
+    Reuses the provided browser instance (cheaper than launching a new one each round).
     Returns (zones, debug_api_urls).
     Each zone: {name, price, status, available}
     """
     api_urls: list[str] = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1280, "height": 900},
-        )
-        page = await context.new_page()
+    context = await browser.new_context(
+        user_agent=USER_AGENT,
+        viewport={"width": 1280, "height": 900},
+    )
+    page = await context.new_page()
 
-        async def on_response(response):
-            ct = response.headers.get("content-type", "")
-            if "json" in ct:
-                try:
-                    body = await response.text()
-                    if "售完" in body:
-                        api_urls.append(response.url)
-                except Exception:
-                    pass
+    async def on_response(response):
+        ct = response.headers.get("content-type", "")
+        if "json" in ct:
+            try:
+                body = await response.text()
+                if "售完" in body:
+                    api_urls.append(response.url)
+            except Exception:
+                pass
 
-        page.on("response", on_response)
+    page.on("response", on_response)
 
-        try:
-            await page.goto(TARGET_URL, wait_until="networkidle", timeout=30000)
-        except Exception:
-            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
-            await asyncio.sleep(4)
+    try:
+        await page.goto(TARGET_URL, wait_until="networkidle", timeout=30000)
+    except Exception:
+        await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+        await asyncio.sleep(4)
 
-        raw = await page.evaluate(_JS_EXTRACT)
-        await context.close()
-        await browser.close()
+    raw = await page.evaluate(_JS_EXTRACT)
+    await context.close()
 
     zones = [
         {
@@ -161,79 +159,85 @@ async def main() -> None:
         f"🔗 {TARGET_URL}"
     )
 
-    # zone_name → True/False/None (None = first check not yet done)
     zone_status: dict[str, bool | None] = {}
     api_logged = False
 
-    while True:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            zones, api_urls = await check_page()
+    # Launch one browser for the entire run — reused across all checks.
+    # Container-friendly flags reduce memory usage in Docker/Render.
+    launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
 
-            # Log API endpoint once (useful for future optimisation)
-            if api_urls and not api_logged:
-                api_logged = True
-                for u in api_urls:
-                    print(f"[{now}] [DEBUG] 票券 API：{u}")
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True, args=launch_args)
 
-            if not zones:
-                print(f"[{now}] [WARN] 未能解析票區資料，頁面可能尚未載入完成")
-                await asyncio.sleep(CHECK_INTERVAL)
-                continue
+        while True:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            try:
+                if not browser.is_connected():
+                    browser = await p.chromium.launch(headless=True, args=launch_args)
 
-            newly_available: list[dict] = []
-            already_available: list[dict] = []
+                zones, api_urls = await check_page(browser)
 
-            for zone in zones:
-                name = zone["name"]
-                if WATCH_ZONES and not any(w in name for w in WATCH_ZONES):
+                if api_urls and not api_logged:
+                    api_logged = True
+                    for u in api_urls:
+                        print(f"[{now}] [DEBUG] 票券 API：{u}")
+
+                if not zones:
+                    print(f"[{now}] [WARN] 未能解析票區資料，頁面可能尚未載入完成")
+                    await asyncio.sleep(CHECK_INTERVAL)
                     continue
 
-                avail = zone["available"]
-                prev = zone_status.get(name)
+                newly_available: list[dict] = []
+                already_available: list[dict] = []
 
-                status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
-                print(f"[{now}] {name} ｜ NT${zone['price']} ｜ {status_label}")
+                for zone in zones:
+                    name = zone["name"]
+                    if WATCH_ZONES and not any(w in name for w in WATCH_ZONES):
+                        continue
 
-                if prev is None and avail:
-                    already_available.append(zone)     # available from the start
-                elif prev is not None and not prev and avail:
-                    newly_available.append(zone)       # just released
+                    avail = zone["available"]
+                    prev = zone_status.get(name)
 
-                zone_status[name] = avail
+                    status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
+                    print(f"[{now}] {name} ｜ NT${zone['price']} ｜ {status_label}")
 
-            # Alert: zones already available when monitor first started
-            if already_available:
-                lines = "\n".join(
-                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
-                    for z in already_available
-                )
-                send_telegram(
-                    f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
-                    f"<b>{EVENT_NAME}</b>\n\n"
-                    f"{lines}\n\n"
-                    f"🔗 <a href='{TARGET_URL}'>立即前往購票</a>"
-                )
+                    if prev is None and avail:
+                        already_available.append(zone)
+                    elif prev is not None and not prev and avail:
+                        newly_available.append(zone)
 
-            # Alert: zones that just transitioned from sold-out to available
-            if newly_available:
-                lines = "\n".join(
-                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
-                    for z in newly_available
-                )
-                send_telegram(
-                    f"🎫 <b>票券釋出通知！</b>\n\n"
-                    f"<b>{EVENT_NAME}</b>\n\n"
-                    f"以下票區有票可購買：\n{lines}\n\n"
-                    f"🔗 <a href='{TARGET_URL}'>立即前往購票</a>\n\n"
-                    f"⏰ 偵測時間：{now}"
-                )
-                print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
+                    zone_status[name] = avail
 
-        except Exception as e:
-            print(f"[{now}] [ERROR] {e}")
+                if already_available:
+                    lines = "\n".join(
+                        f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                        for z in already_available
+                    )
+                    send_telegram(
+                        f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
+                        f"<b>{EVENT_NAME}</b>\n\n"
+                        f"{lines}\n\n"
+                        f"🔗 <a href='{TARGET_URL}'>立即前往購票</a>"
+                    )
 
-        await asyncio.sleep(CHECK_INTERVAL)
+                if newly_available:
+                    lines = "\n".join(
+                        f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                        for z in newly_available
+                    )
+                    send_telegram(
+                        f"🎫 <b>票券釋出通知！</b>\n\n"
+                        f"<b>{EVENT_NAME}</b>\n\n"
+                        f"以下票區有票可購買：\n{lines}\n\n"
+                        f"🔗 <a href='{TARGET_URL}'>立即前往購票</a>\n\n"
+                        f"⏰ 偵測時間：{now}"
+                    )
+                    print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
+
+            except Exception as e:
+                print(f"[{now}] [ERROR] {e}")
+
+            await asyncio.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":

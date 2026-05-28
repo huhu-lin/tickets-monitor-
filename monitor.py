@@ -403,6 +403,34 @@ def _handle_update_safe(update: dict) -> None:
         print(f"[BOT] 指令處理錯誤：{e}")
 
 
+def register_bot_commands() -> None:
+    """Register bot commands so Telegram shows the shortcut menu."""
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    commands = [
+        {"command": "check",    "description": "立即檢查並回傳當下票況"},
+        {"command": "status",   "description": "顯示目前設定與狀態"},
+        {"command": "seturl",   "description": "設定監控網址"},
+        {"command": "setevent", "description": "設定場次顯示名稱"},
+        {"command": "setzones", "description": "設定票區篩選（逗號分隔，留空=全部）"},
+        {"command": "pause",    "description": "暫停監控"},
+        {"command": "resume",   "description": "繼續監控"},
+        {"command": "help",     "description": "顯示說明"},
+    ]
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setMyCommands",
+            json={"commands": commands},
+            timeout=10,
+        )
+        if resp.ok and resp.json().get("ok"):
+            print("[BOT] 指令選單已註冊")
+        else:
+            print(f"[BOT] 指令選單註冊失敗：{resp.text}")
+    except Exception as e:
+        print(f"[BOT] 指令選單註冊錯誤：{e}")
+
+
 def register_telegram_webhook() -> bool:
     """Switch the bot to webhook mode so cold-started Render instances
     can wake up on incoming Telegram messages. Returns True on success."""
@@ -606,6 +634,7 @@ if __name__ == "__main__":
     # before serve_forever returns control, so by the time the next statement
     # runs the socket is already accepting connections.
     threading.Thread(target=start_web_server, daemon=True).start()
+    register_bot_commands()
     if not register_telegram_webhook():
         # No RENDER_EXTERNAL_URL (likely local dev) or webhook setup failed:
         # fall back to long-polling so the bot still works.

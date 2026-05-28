@@ -115,8 +115,8 @@ def self_ping() -> None:
 
 _HELP = (
     "📋 <b>可用指令</b>\n\n"
-    "/seturl <網址> — 設定監控網址\n"
-    "/setzones <關鍵字,關鍵字> — 設定票區篩選（留空=全部）\n"
+    "/seturl 網址 — 設定監控網址\n"
+    "/setzones 關鍵字,關鍵字 — 設定票區篩選（留空=全部）\n"
     "/status — 顯示目前設定與狀態\n"
     "/pause — 暫停監控\n"
     "/resume — 繼續監控\n"
@@ -147,7 +147,7 @@ def _handle_update(update: dict) -> None:
 
     elif cmd == "/seturl":
         if not arg:
-            send_telegram("用法：/seturl <網址>")
+            send_telegram("用法：/seturl 網址\n例如：\n<code>/seturl https://guardians.fami.life/...</code>")
         else:
             _config["target_url"] = arg
             _config["event_name"] = "自訂場次"

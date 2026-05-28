@@ -8,6 +8,7 @@
 - 偵測「售完 → 有票」時立即發送 Telegram 通知，包含票區名稱與剩餘張數
 - 使用 Playwright 無頭瀏覽器，應對 JS 渲染頁面與防爬機制
 - 支援 `WATCH_ZONES` 篩選特定票區（如只看「B1層」或「外野」）
+- **Telegram 指令**：隨時更換監控網址與票區，不需重新部署
 
 ---
 
@@ -58,6 +59,28 @@ cp .env.example .env
 
 # 執行
 python monitor.py
+```
+
+---
+
+## Telegram 指令
+
+部署後直接對 bot 發指令，即時生效，不需重新部署：
+
+| 指令 | 說明 |
+|------|------|
+| `/seturl <網址>` | 換成新的票券監控網址（票區篩選自動重設） |
+| `/setzones B1層,外野` | 設定票區篩選關鍵字（逗號分隔） |
+| `/setzones` | 清除篩選，監控全部票區 |
+| `/status` | 查看目前監控場次、篩選、最後檢查時間 |
+| `/pause` | 暫停監控 |
+| `/resume` | 繼續監控 |
+| `/help` | 顯示所有指令 |
+
+**換場次範例：**
+```
+/seturl https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=xxxxxxxx&PRODUCT_ID=xxxxxxxx
+/setzones 搖滾,中央
 ```
 
 ---

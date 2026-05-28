@@ -11,14 +11,14 @@
 
 ---
 
-## 部署到 Render（推薦，電腦可關機）
+## 部署到 Render（免費方案，電腦可關機）
 
-### 1. 在 Render 建立 Background Worker
+### 1. 在 Render 建立 Web Service
 
-1. 前往 [render.com](https://render.com) → **New → Background Worker**
+1. 前往 [render.com](https://render.com) → **New → Web Service**
 2. 連結此 GitHub 倉庫
-3. Runtime 選 **Docker**（Render 會自動偵測 `Dockerfile`）
-4. Plan 選 **Starter**（$7 美元/月，Background Worker 需要付費方案）
+3. Runtime 選 **Docker**（自動偵測 `Dockerfile`）
+4. Plan 選 **Free**
 
 ### 2. 設定環境變數
 
@@ -36,6 +36,8 @@
 ### 3. 部署
 
 點 **Deploy** 即可，之後每次 push 到 GitHub 會自動重新部署。
+
+> **防止睡眠**：Render 免費方案閒置 15 分鐘後會休眠。腳本已內建每 10 分鐘自我 ping 一次（使用 Render 自動提供的 `RENDER_EXTERNAL_URL`），不需要額外設定。
 
 ---
 

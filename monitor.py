@@ -1,7 +1,10 @@
 import asyncio
 import os
+import threading
+import time
 import requests
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
 
@@ -19,6 +22,7 @@ WATCH_ZONES = [z.strip() for z in os.getenv("WATCH_ZONES", "").split(",") if z.s
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")  # auto-set by Render
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -71,6 +75,42 @@ _JS_EXTRACT = r"""
     return zones;
 }
 """
+
+
+# Shared status dict updated by the monitor loop, read by the HTTP handler
+_status: dict = {"last_check": "尚未執行", "zones": 0}
+
+
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = (
+            f"OK\n"
+            f"最後檢查：{_status['last_check']}\n"
+            f"追蹤票區：{_status['zones']}"
+        ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass  # Suppress per-request logs
+
+
+def start_web_server() -> None:
+    port = int(os.getenv("PORT", "10000"))
+    HTTPServer(("0.0.0.0", port), _HealthHandler).serve_forever()
+
+
+def self_ping() -> None:
+    """Ping own health endpoint so Render free tier doesn't spin down."""
+    if not RENDER_EXTERNAL_URL:
+        return
+    try:
+        requests.get(f"{RENDER_EXTERNAL_URL}/", timeout=5)
+    except Exception:
+        pass
 
 
 def send_telegram(message: str) -> None:
@@ -161,9 +201,9 @@ async def main() -> None:
 
     zone_status: dict[str, bool | None] = {}
     api_logged = False
+    last_ping_time = 0.0
+    PING_INTERVAL = 600  # self-ping every 10 minutes to prevent Render sleep
 
-    # Launch one browser for the entire run — reused across all checks.
-    # Container-friendly flags reduce memory usage in Docker/Render.
     launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
 
     async with async_playwright() as p:
@@ -174,6 +214,11 @@ async def main() -> None:
             try:
                 if not browser.is_connected():
                     browser = await p.chromium.launch(headless=True, args=launch_args)
+
+                # Self-ping to keep Render free tier awake
+                if time.time() - last_ping_time >= PING_INTERVAL:
+                    self_ping()
+                    last_ping_time = time.time()
 
                 zones, api_urls = await check_page(browser)
 
@@ -186,6 +231,9 @@ async def main() -> None:
                     print(f"[{now}] [WARN] 未能解析票區資料，頁面可能尚未載入完成")
                     await asyncio.sleep(CHECK_INTERVAL)
                     continue
+
+                _status["last_check"] = now
+                _status["zones"] = len(zones)
 
                 newly_available: list[dict] = []
                 already_available: list[dict] = []
@@ -241,4 +289,6 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
+    # Start health endpoint in background thread (required by Render web service)
+    threading.Thread(target=start_web_server, daemon=True).start()
     asyncio.run(main())

@@ -3,41 +3,74 @@ import os
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright, Browser
+from playwright.async_api import async_playwright
 
 load_dotenv()
+
+TARGET_URL = os.getenv(
+    "TARGET_URL",
+    "https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q"
+)
+EVENT_NAME = os.getenv("EVENT_NAME", "Guardians UTK0204")
+# Comma-separated keywords to filter zones (empty = watch all)
+# e.g. "B1層,外野" watches only zones whose names contain "B1層" or "外野"
+WATCH_ZONES = [z.strip() for z in os.getenv("WATCH_ZONES", "").split(",") if z.strip()]
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 
-SOLD_OUT_KEYWORDS = ["售完", "已售完", "完售", "缺貨", "SOLD OUT", "Sold Out", "sold out"]
-BUY_BUTTON_TEXTS = ["立即購票", "加入購物車", "購買", "購票", "Buy", "Add to Cart"]
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
+# JavaScript injected into the page to extract zone rows.
+# Tries a standard <table> first, then falls back to finding leaf nodes
+# with text "售完" and walking up the DOM to find the row context.
+_JS_EXTRACT = r"""
+() => {
+    const zones = [];
 
-def load_targets() -> list[dict]:
-    """
-    Load monitoring targets from env vars.
-    Reads TARGET_1_NAME / TARGET_1_URL, TARGET_2_NAME / TARGET_2_URL, ...
-    Falls back to the legacy single-target TARGET_URL / EVENT_NAME if present.
-    """
-    targets = []
-    i = 1
-    while True:
-        name = os.getenv(f"TARGET_{i}_NAME")
-        url = os.getenv(f"TARGET_{i}_URL")
-        if not name or not url:
-            break
-        targets.append({"name": name, "url": url})
-        i += 1
+    // Strategy 1: standard <table>
+    const rows = document.querySelectorAll('table tr');
+    for (const row of rows) {
+        const cells = row.querySelectorAll('td');
+        if (cells.length < 3) continue;
+        const name   = (cells[0].innerText || '').trim();
+        const price  = (cells[1].innerText || '').trim().replace(/[^\d]/g, '');
+        const status = (cells[2].innerText || '').trim();
+        if (name.length > 1 && price && (status === '售完' || /^\d+$/.test(status))) {
+            zones.push({ name, price, status });
+        }
+    }
+    if (zones.length > 0) return zones;
 
-    # Legacy fallback
-    if not targets:
-        url = os.getenv("TARGET_URL", "https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q")
-        name = os.getenv("EVENT_NAME", "Guardians UTK0204")
-        targets.append({"name": name, "url": url})
+    // Strategy 2: div-based layout — find leaf "售完" nodes, walk up
+    const leaves = Array.from(document.querySelectorAll('*'))
+        .filter(el => !el.children.length && (el.innerText || '').trim() === '售完');
+    for (const el of leaves) {
+        let p = el.parentElement;
+        for (let d = 0; d < 6 && p; d++, p = p.parentElement) {
+            const kids = Array.from(p.children)
+                .map(c => (c.innerText || '').trim())
+                .filter(Boolean);
+            if (kids.length >= 3) {
+                const name   = kids[0];
+                const status = kids[kids.length - 1];
+                const price  = kids.find(t => /^\d{3,5}$/.test(t)) || '';
+                if (name.length > 2 && price && (status === '售完' || /^\d+$/.test(status))) {
+                    zones.push({ name, price, status });
+                    break;
+                }
+            }
+        }
+    }
 
-    return targets
+    return zones;
+}
+"""
 
 
 def send_telegram(message: str) -> None:
@@ -57,115 +90,150 @@ def send_telegram(message: str) -> None:
         print(f"[WARN] 發送 Telegram 通知失敗：{e}")
 
 
-async def check_one(browser: Browser, target: dict, api_urls_logged: set) -> bool:
-    """Check a single target URL. Returns True if tickets are available."""
-    context = await browser.new_context(
-        user_agent=(
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        viewport={"width": 1280, "height": 800},
-    )
-    page = await context.new_page()
-    intercepted: list[str] = []
+async def check_page() -> tuple[list[dict], list[str]]:
+    """
+    Load the ticket page and extract per-zone availability.
+    Returns (zones, debug_api_urls).
+    Each zone: {name, price, status, available}
+    """
+    api_urls: list[str] = []
 
-    async def on_response(response):
-        ct = response.headers.get("content-type", "")
-        if "json" in ct and any(
-            k in response.url for k in ["ticket", "product", "seat", "stock", "avail", "remain"]
-        ):
-            intercepted.append(response.url)
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=True)
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1280, "height": 900},
+        )
+        page = await context.new_page()
 
-    page.on("response", on_response)
+        async def on_response(response):
+            ct = response.headers.get("content-type", "")
+            if "json" in ct:
+                try:
+                    body = await response.text()
+                    if "售完" in body:
+                        api_urls.append(response.url)
+                except Exception:
+                    pass
 
-    try:
-        await page.goto(target["url"], wait_until="networkidle", timeout=30000)
-    except Exception:
-        await page.goto(target["url"], wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(3)
+        page.on("response", on_response)
 
-    content = await page.content()
+        try:
+            await page.goto(TARGET_URL, wait_until="networkidle", timeout=30000)
+        except Exception:
+            await page.goto(TARGET_URL, wait_until="domcontentloaded", timeout=30000)
+            await asyncio.sleep(4)
 
-    has_sold_out_text = any(kw in content for kw in SOLD_OUT_KEYWORDS)
+        raw = await page.evaluate(_JS_EXTRACT)
+        await context.close()
+        await browser.close()
 
-    active_buy_button = False
-    for text in BUY_BUTTON_TEXTS:
-        btn = await page.query_selector(f'button:has-text("{text}")')
-        if btn and await btn.get_attribute("disabled") is None:
-            active_buy_button = True
-            break
-
-    await context.close()
-
-    # Log intercepted API URLs once per target
-    key = target["name"]
-    if intercepted and key not in api_urls_logged:
-        api_urls_logged.add(key)
-        print(f"  [DEBUG] {key} — 偵測到 API endpoints：")
-        for u in intercepted:
-            print(f"          {u}")
-
-    return (not has_sold_out_text) and active_buy_button
+    zones = [
+        {
+            "name": z["name"],
+            "price": z["price"],
+            "status": z["status"],
+            "available": z["status"] != "售完",
+        }
+        for z in raw
+        if z.get("name") and len(z["name"]) >= 2
+    ]
+    return zones, api_urls
 
 
 async def main() -> None:
-    targets = load_targets()
-
-    print(f"[監控啟動] 共 {len(targets)} 個監控目標，每 {CHECK_INTERVAL} 秒檢查一次")
-    for t in targets:
-        print(f"  • {t['name']}")
-        print(f"    {t['url']}")
+    filter_label = "、".join(WATCH_ZONES) if WATCH_ZONES else "全部"
+    print(f"[監控啟動] {EVENT_NAME}")
+    print(f"[目標 URL] {TARGET_URL}")
+    print(f"[篩選票區] {filter_label}")
+    print(f"[檢查間隔] 每 {CHECK_INTERVAL} 秒")
     print("-" * 60)
 
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("[警告] 未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，不會發送通知")
-        print("       請複製 .env.example 為 .env 並填入對應值")
         print("-" * 60)
 
-    target_lines = "\n".join(f"• {t['name']}" for t in targets)
     send_telegram(
         f"✅ <b>票券監控已啟動</b>\n\n"
-        f"監控目標：\n{target_lines}\n\n"
-        f"檢查間隔：每 {CHECK_INTERVAL} 秒"
+        f"場次：{EVENT_NAME}\n"
+        f"篩選票區：{filter_label}\n"
+        f"檢查間隔：每 {CHECK_INTERVAL} 秒\n\n"
+        f"🔗 {TARGET_URL}"
     )
 
-    last_available: dict[str, bool | None] = {t["name"]: None for t in targets}
-    api_urls_logged: set[str] = set()
+    # zone_name → True/False/None (None = first check not yet done)
+    zone_status: dict[str, bool | None] = {}
+    api_logged = False
 
-    async with async_playwright() as p:
-        while True:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            browser = await p.chromium.launch(headless=True)
+    while True:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        try:
+            zones, api_urls = await check_page()
 
-            try:
-                for target in targets:
-                    name = target["name"]
-                    try:
-                        is_available = await check_one(browser, target, api_urls_logged)
-                        status_label = "✅ 有票" if is_available else "❌ 售完"
-                        print(f"[{now}] {name}：{status_label}")
+            # Log API endpoint once (useful for future optimisation)
+            if api_urls and not api_logged:
+                api_logged = True
+                for u in api_urls:
+                    print(f"[{now}] [DEBUG] 票券 API：{u}")
 
-                        prev = last_available[name]
-                        if prev is not None and not prev and is_available:
-                            msg = (
-                                f"🎫 <b>票券釋出通知！</b>\n\n"
-                                f"<b>{name}</b> 有票可以購買了！\n\n"
-                                f"🔗 <a href='{target['url']}'>立即前往購票</a>\n\n"
-                                f"⏰ 偵測時間：{now}"
-                            )
-                            send_telegram(msg)
-                            print(f"[{now}] Telegram 通知已發送（{name}）")
+            if not zones:
+                print(f"[{now}] [WARN] 未能解析票區資料，頁面可能尚未載入完成")
+                await asyncio.sleep(CHECK_INTERVAL)
+                continue
 
-                        last_available[name] = is_available
+            newly_available: list[dict] = []
+            already_available: list[dict] = []
 
-                    except Exception as e:
-                        print(f"[{now}] [ERROR] {name}：{e}")
+            for zone in zones:
+                name = zone["name"]
+                if WATCH_ZONES and not any(w in name for w in WATCH_ZONES):
+                    continue
 
-            finally:
-                await browser.close()
+                avail = zone["available"]
+                prev = zone_status.get(name)
 
-            await asyncio.sleep(CHECK_INTERVAL)
+                status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
+                print(f"[{now}] {name} ｜ NT${zone['price']} ｜ {status_label}")
+
+                if prev is None and avail:
+                    already_available.append(zone)     # available from the start
+                elif prev is not None and not prev and avail:
+                    newly_available.append(zone)       # just released
+
+                zone_status[name] = avail
+
+            # Alert: zones already available when monitor first started
+            if already_available:
+                lines = "\n".join(
+                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                    for z in already_available
+                )
+                send_telegram(
+                    f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
+                    f"<b>{EVENT_NAME}</b>\n\n"
+                    f"{lines}\n\n"
+                    f"🔗 <a href='{TARGET_URL}'>立即前往購票</a>"
+                )
+
+            # Alert: zones that just transitioned from sold-out to available
+            if newly_available:
+                lines = "\n".join(
+                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                    for z in newly_available
+                )
+                send_telegram(
+                    f"🎫 <b>票券釋出通知！</b>\n\n"
+                    f"<b>{EVENT_NAME}</b>\n\n"
+                    f"以下票區有票可購買：\n{lines}\n\n"
+                    f"🔗 <a href='{TARGET_URL}'>立即前往購票</a>\n\n"
+                    f"⏰ 偵測時間：{now}"
+                )
+                print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
+
+        except Exception as e:
+            print(f"[{now}] [ERROR] {e}")
+
+        await asyncio.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":

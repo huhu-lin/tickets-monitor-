@@ -40,7 +40,9 @@ TARGET_2_NAME=三樓外野區
 TARGET_2_URL=https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=xxxxxxxx
 ```
 
-每個票種或區域用一組 `TARGET_N_NAME` + `TARGET_N_URL` 定義，數字從 1 開始連續編號，可新增任意數量。
+使用 `WATCH_ZONES` 篩選要監控的票區（逗號分隔關鍵字），不填則監控全部票區。
+關鍵字對應頁面上的分類標籤：**內野、B1層、熱力區、熱區、一般區、L2層、L4層、L5層、外野、輪椅席**，
+也可以填票區名稱中的任意文字，例如「搖滾」、「中央」。
 
 ---
 
@@ -69,17 +71,19 @@ TARGET_2_URL=https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUC
 python monitor.py
 ```
 
-啟動後 console 會持續顯示每輪的檢查狀態：
+啟動後 console 會逐一列出每個票區的狀態，每 60 秒更新一次：
 
 ```
 [監控啟動] Guardians UTK0204
 [目標 URL] https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q
+[篩選票區] 全部
 [檢查間隔] 每 60 秒
 ------------------------------------------------------------
-[2026-05-28 12:00:00] 狀態：❌ 售完
-[2026-05-28 12:01:00] 狀態：❌ 售完
+[2026-05-28 12:00:00] B1_108搖滾熱力區 ｜ NT$2500 ｜ ❌ 售完
+[2026-05-28 12:00:00] B1_108應援熱力區 ｜ NT$2200 ｜ ❌ 售完
+[2026-05-28 12:00:00] B1_109搖滾熱力區 ｜ NT$2500 ｜ ❌ 售完
 ...
-[2026-05-28 12:30:00] 狀態：✅ 有票   ← 此時發送 Telegram 通知
+[2026-05-28 12:30:00] B1_108搖滾熱力區 ｜ NT$2500 ｜ ✅ 有票（剩 3）  ← 發送通知
 ```
 
 ---

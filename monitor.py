@@ -1,12 +1,12 @@
-import asyncio
 import os
+import re
 import threading
 import time
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
 
 load_dotenv()
 
@@ -15,57 +15,24 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/124.0.0.0 Safari/537.36"
-)
-
-_JS_EXTRACT = r"""
-() => {
-    const zones = [];
-
-    // Strategy 1: standard <table>
-    const rows = document.querySelectorAll('table tr');
-    for (const row of rows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 3) continue;
-        const name   = (cells[0].innerText || '').trim();
-        const price  = (cells[1].innerText || '').trim().replace(/[^\d]/g, '');
-        const status = (cells[2].innerText || '').trim();
-        if (name.length > 1 && price && (status === '售完' || /^\d+$/.test(status))) {
-            zones.push({ name, price, status });
-        }
-    }
-    if (zones.length > 0) return zones;
-
-    // Strategy 2: div-based layout — find leaf "售完" nodes, walk up
-    const leaves = Array.from(document.querySelectorAll('*'))
-        .filter(el => !el.children.length && (el.innerText || '').trim() === '售完');
-    for (const el of leaves) {
-        let p = el.parentElement;
-        for (let d = 0; d < 6 && p; d++, p = p.parentElement) {
-            const kids = Array.from(p.children)
-                .map(c => (c.innerText || '').trim())
-                .filter(Boolean);
-            if (kids.length >= 3) {
-                const name   = kids[0];
-                const status = kids[kids.length - 1];
-                const price  = kids.find(t => /^\d{3,5}$/.test(t)) || '';
-                if (name.length > 2 && price && (status === '售完' || /^\d+$/.test(status))) {
-                    zones.push({ name, price, status });
-                    break;
-                }
-            }
-        }
-    }
-
-    return zones;
+_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
 }
-"""
 
 # ---------------------------------------------------------------------------
-# Runtime config — mutated by Telegram commands, read by the monitor loop
+# Runtime config — mutated by Telegram commands
 # ---------------------------------------------------------------------------
 _config: dict = {
     "target_url": os.getenv(
@@ -75,13 +42,16 @@ _config: dict = {
     "event_name": os.getenv("EVENT_NAME", "Guardians UTK0204"),
     "watch_zones": [z.strip() for z in os.getenv("WATCH_ZONES", "").split(",") if z.strip()],
     "paused": False,
-    "url_changed": False,  # signal to main loop to reset zone tracking
+    "url_changed": False,
 }
 
 _status: dict = {"last_check": "尚未執行", "zones": 0}
 
+_session = requests.Session()
+_session.headers.update(_HEADERS)
+
 # ---------------------------------------------------------------------------
-# Health endpoint (Render Web Service requirement)
+# Health endpoint
 # ---------------------------------------------------------------------------
 
 class _HealthHandler(BaseHTTPRequestHandler):
@@ -161,7 +131,6 @@ def _handle_update(update: dict) -> None:
     msg = update.get("message") or update.get("edited_message") or {}
     chat_id = str(msg.get("chat", {}).get("id", ""))
 
-    # Only accept commands from the configured chat
     if chat_id != str(TELEGRAM_CHAT_ID):
         return
 
@@ -170,7 +139,7 @@ def _handle_update(update: dict) -> None:
         return
 
     parts = text.split(None, 1)
-    cmd = parts[0].lower().split("@")[0]   # handle /cmd@botname format
+    cmd = parts[0].lower().split("@")[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
 
     if cmd == "/help":
@@ -178,22 +147,21 @@ def _handle_update(update: dict) -> None:
 
     elif cmd == "/seturl":
         if not arg:
-            send_telegram("用法：/seturl <網址>\n\n例如：\n<code>/seturl https://guardians.fami.life/...</code>")
+            send_telegram("用法：/seturl <網址>")
         else:
             _config["target_url"] = arg
             _config["event_name"] = "自訂場次"
             _config["watch_zones"] = []
             _config["url_changed"] = True
             send_telegram(
-                f"✅ <b>已更新監控網址</b>\n\n"
-                f"{arg}\n\n"
+                f"✅ <b>已更新監控網址</b>\n\n{arg}\n\n"
                 f"票區篩選已重設為「全部」，下一輪開始監控新場次。"
             )
 
     elif cmd == "/setzones":
         zones = [z.strip() for z in arg.split(",") if z.strip()]
         _config["watch_zones"] = zones
-        _config["url_changed"] = True  # reset zone state for new filter
+        _config["url_changed"] = True
         if zones:
             send_telegram(f"✅ 已設定篩選票區：{'、'.join(zones)}")
         else:
@@ -225,7 +193,6 @@ def _handle_update(update: dict) -> None:
 
 
 def telegram_command_thread() -> None:
-    """Long-poll Telegram for incoming commands in a background thread."""
     if not TELEGRAM_BOT_TOKEN:
         return
     offset = 0
@@ -250,55 +217,85 @@ def telegram_command_thread() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Page scraping
+# Page scraping (requests + BeautifulSoup, no browser required)
 # ---------------------------------------------------------------------------
 
-async def check_page(browser, url: str) -> tuple[list[dict], list[str]]:
-    api_urls: list[str] = []
-    context = await browser.new_context(
-        user_agent=USER_AGENT,
-        viewport={"width": 1280, "height": 900},
-    )
-    page = await context.new_page()
+def _parse_html_table(soup: BeautifulSoup) -> list[dict]:
+    """Extract zones from a standard HTML table (票區 / 票價 / 空位)."""
+    zones = []
+    for row in soup.select("table tr"):
+        cells = row.find_all("td")
+        if len(cells) < 3:
+            continue
+        name = cells[0].get_text(strip=True)
+        price = re.sub(r"[^\d]", "", cells[1].get_text(strip=True))
+        status = cells[2].get_text(strip=True)
+        if name and price and (status == "售完" or status.isdigit()):
+            zones.append({"name": name, "price": price, "status": status})
+    return zones
 
-    async def on_response(response):
-        ct = response.headers.get("content-type", "")
-        if "json" in ct:
-            try:
-                body = await response.text()
-                if "售完" in body:
-                    api_urls.append(response.url)
-            except Exception:
-                pass
 
-    page.on("response", on_response)
+def _parse_embedded_json(soup: BeautifulSoup) -> list[dict]:
+    """
+    Look for zone data embedded in <script> tags.
+    Many SSR React/Vue apps serialize initial state as JSON in the page.
+    """
+    zones = []
+    for script in soup.find_all("script"):
+        content = script.string or ""
+        if "售完" not in content:
+            continue
+        # Look for JSON arrays/objects containing 售完
+        # Extract all quoted strings near 售完 to find zone names and prices
+        # Pattern: "name":"...","price":NNNN,"status":"售完"
+        for m in re.finditer(
+            r'"(?:name|zoneName|areaName|seatName)"\s*:\s*"([^"]+)"'
+            r'(?:.*?)"(?:price|ticketPrice|amount)"\s*:\s*(\d+)'
+            r'(?:.*?)"(?:status|availability|remain|空位)"\s*:\s*"?(\d+|售完)"?',
+            content,
+            re.DOTALL,
+        ):
+            zones.append({"name": m.group(1), "price": m.group(2), "status": m.group(3)})
 
-    try:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-    except Exception:
-        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-        await asyncio.sleep(4)
+        if not zones:
+            # Looser: find any occurrence of 售完 near a zone-like name
+            for m in re.finditer(r'"([A-Z0-9_一-鿿]{3,30})"\s*,\s*(\d{3,5})\s*,\s*"?(售完|\d+)"?', content):
+                zones.append({"name": m.group(1), "price": m.group(2), "status": m.group(3)})
 
-    raw = await page.evaluate(_JS_EXTRACT)
-    await context.close()
+        if zones:
+            break
+    return zones
+
+
+def check_page(url: str) -> list[dict]:
+    """
+    Fetch the ticket page and extract per-zone availability.
+    Uses requests + BeautifulSoup; no browser required.
+    Returns list of {name, price, status, available}.
+    """
+    resp = _session.get(url, timeout=30)
+
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}，網站可能需要瀏覽器才能存取")
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    zones = _parse_html_table(soup)
+    if not zones:
+        zones = _parse_embedded_json(soup)
 
     return [
-        {
-            "name": z["name"],
-            "price": z["price"],
-            "status": z["status"],
-            "available": z["status"] != "售完",
-        }
-        for z in raw
+        {**z, "available": z["status"] != "售完"}
+        for z in zones
         if z.get("name") and len(z["name"]) >= 2
-    ], api_urls
+    ]
 
 
 # ---------------------------------------------------------------------------
-# Main monitor loop
+# Main monitor loop (synchronous — no asyncio needed without Playwright)
 # ---------------------------------------------------------------------------
 
-async def main() -> None:
+def main() -> None:
     zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
     print(f"[監控啟動] {_config['event_name']}")
     print(f"[目標 URL] {_config['target_url']}")
@@ -320,109 +317,96 @@ async def main() -> None:
     )
 
     zone_status: dict[str, bool | None] = {}
-    api_logged = False
-    last_ping_time = 0.0
     last_url = _config["target_url"]
+    last_ping = 0.0
 
-    launch_args = ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"]
+    while True:
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True, args=launch_args)
+        if _config["url_changed"] or _config["target_url"] != last_url:
+            zone_status.clear()
+            last_url = _config["target_url"]
+            _config["url_changed"] = False
+            print(f"[{now}] 設定已更新，重設票區追蹤狀態")
 
-        while True:
-            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if _config["paused"]:
+            time.sleep(CHECK_INTERVAL)
+            continue
 
-            # Handle URL/zone change from Telegram command
-            if _config["url_changed"] or _config["target_url"] != last_url:
-                zone_status.clear()
-                api_logged = False
-                last_url = _config["target_url"]
-                _config["url_changed"] = False
-                print(f"[{now}] 設定已更新，重設票區追蹤狀態")
+        if time.time() - last_ping >= 600:
+            self_ping()
+            last_ping = time.time()
 
-            if _config["paused"]:
-                await asyncio.sleep(CHECK_INTERVAL)
+        try:
+            zones = check_page(_config["target_url"])
+
+            if not zones:
+                print(
+                    f"[{now}] [WARN] 未解析到票區資料。"
+                    f"若持續出現，此網站可能需要瀏覽器才能載入（JavaScript 渲染）。"
+                )
+                time.sleep(CHECK_INTERVAL)
                 continue
 
-            try:
-                if not browser.is_connected():
-                    browser = await p.chromium.launch(headless=True, args=launch_args)
+            _status["last_check"] = now
+            _status["zones"] = len(zones)
 
-                if time.time() - last_ping_time >= 600:
-                    self_ping()
-                    last_ping_time = time.time()
+            current_zones = _config["watch_zones"]
+            event_name = _config["event_name"]
+            current_url = _config["target_url"]
 
-                current_url = _config["target_url"]
-                current_zones = _config["watch_zones"]
-                event_name = _config["event_name"]
+            newly_available: list[dict] = []
+            already_available: list[dict] = []
 
-                zones, api_urls = await check_page(browser, current_url)
-
-                if api_urls and not api_logged:
-                    api_logged = True
-                    for u in api_urls:
-                        print(f"[{now}] [DEBUG] 票券 API：{u}")
-
-                if not zones:
-                    print(f"[{now}] [WARN] 未能解析票區資料，頁面可能尚未載入完成")
-                    await asyncio.sleep(CHECK_INTERVAL)
+            for zone in zones:
+                name = zone["name"]
+                if current_zones and not any(w in name for w in current_zones):
                     continue
 
-                _status["last_check"] = now
-                _status["zones"] = len(zones)
+                avail = zone["available"]
+                prev = zone_status.get(name)
+                status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
+                print(f"[{now}] {name} ｜ NT${zone['price']} ｜ {status_label}")
 
-                newly_available: list[dict] = []
-                already_available: list[dict] = []
+                if prev is None and avail:
+                    already_available.append(zone)
+                elif prev is not None and not prev and avail:
+                    newly_available.append(zone)
 
-                for zone in zones:
-                    name = zone["name"]
-                    if current_zones and not any(w in name for w in current_zones):
-                        continue
+                zone_status[name] = avail
 
-                    avail = zone["available"]
-                    prev = zone_status.get(name)
-                    status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
-                    print(f"[{now}] {name} ｜ NT${zone['price']} ｜ {status_label}")
+            if already_available:
+                lines = "\n".join(
+                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                    for z in already_available
+                )
+                send_telegram(
+                    f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
+                    f"<b>{event_name}</b>\n\n{lines}\n\n"
+                    f"🔗 <a href='{current_url}'>立即前往購票</a>"
+                )
 
-                    if prev is None and avail:
-                        already_available.append(zone)
-                    elif prev is not None and not prev and avail:
-                        newly_available.append(zone)
+            if newly_available:
+                lines = "\n".join(
+                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                    for z in newly_available
+                )
+                send_telegram(
+                    f"🎫 <b>票券釋出通知！</b>\n\n"
+                    f"<b>{event_name}</b>\n\n"
+                    f"以下票區有票可購買：\n{lines}\n\n"
+                    f"🔗 <a href='{current_url}'>立即前往購票</a>\n\n"
+                    f"⏰ 偵測時間：{now}"
+                )
+                print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
 
-                    zone_status[name] = avail
+        except Exception as e:
+            print(f"[{now}] [ERROR] {e}")
 
-                if already_available:
-                    lines = "\n".join(
-                        f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
-                        for z in already_available
-                    )
-                    send_telegram(
-                        f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
-                        f"<b>{event_name}</b>\n\n{lines}\n\n"
-                        f"🔗 <a href='{current_url}'>立即前往購票</a>"
-                    )
-
-                if newly_available:
-                    lines = "\n".join(
-                        f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
-                        for z in newly_available
-                    )
-                    send_telegram(
-                        f"🎫 <b>票券釋出通知！</b>\n\n"
-                        f"<b>{event_name}</b>\n\n"
-                        f"以下票區有票可購買：\n{lines}\n\n"
-                        f"🔗 <a href='{current_url}'>立即前往購票</a>\n\n"
-                        f"⏰ 偵測時間：{now}"
-                    )
-                    print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
-
-            except Exception as e:
-                print(f"[{now}] [ERROR] {e}")
-
-            await asyncio.sleep(CHECK_INTERVAL)
+        time.sleep(CHECK_INTERVAL)
 
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
     threading.Thread(target=telegram_command_thread, daemon=True).start()
-    asyncio.run(main())
+    main()

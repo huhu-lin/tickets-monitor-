@@ -266,11 +266,16 @@ def _handle_update(update: dict) -> None:
             lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
 
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        purchase_link = (
+            f"\n🔗 <a href='{_config['target_url']}'>立即前往購票</a>"
+            if available_count > 0 else ""
+        )
         send_telegram(
             f"📋 <b>即時票況</b>\n\n"
             + "\n".join(lines)
             + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
             f"⏰ {now}"
+            + purchase_link
         )
 
     elif cmd == "/seturl":

@@ -12,9 +12,8 @@ services:
         sync: false
       - key: CHECK_INTERVAL
         value: "60"
-      - key: TARGET_URL
-        value: "https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q"
-      - key: EVENT_NAME
-        value: "Guardians UTK0204"
-      - key: WATCH_ZONES
-        value: ""
+      # TARGET_URL / EVENT_NAME / WATCH_ZONES intentionally omitted so the
+      # service boots into standby; configure them at runtime via Telegram:
+      #   /seturl 網址
+      #   /setevent 場次名稱
+      #   /setzones 關鍵字

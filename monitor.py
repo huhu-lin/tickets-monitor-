@@ -429,6 +429,14 @@ def main() -> None:
             notified_idle = False
             print(f"[{now}] 設定已更新，重設票區追蹤狀態")
 
+        # Run self-ping before any standby/paused short-circuit so the Render
+        # free instance keeps receiving traffic and does not spin down,
+        # otherwise the Telegram polling thread would also die and /seturl
+        # could not wake the service back up.
+        if time.time() - last_ping >= 600:
+            self_ping()
+            last_ping = time.time()
+
         if not target_url:
             if not notified_idle:
                 print(f"[{now}] 待機中：尚未設定監控網址")
@@ -439,10 +447,6 @@ def main() -> None:
         if paused:
             time.sleep(CHECK_INTERVAL)
             continue
-
-        if time.time() - last_ping >= 600:
-            self_ping()
-            last_ping = time.time()
 
         try:
             zones = check_page(target_url)

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import os
 import re
 import threading
@@ -13,7 +15,20 @@ load_dotenv()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
-RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+# Webhook path is a token-derived hash so random scanners can't hit the
+# endpoint. The secret_token header (separate hash) is the real auth — paths
+# can leak into access logs, headers usually don't.
+WEBHOOK_PATH = (
+    "/tg/" + hashlib.sha256(TELEGRAM_BOT_TOKEN.encode()).hexdigest()[:32]
+    if TELEGRAM_BOT_TOKEN else ""
+)
+WEBHOOK_SECRET = (
+    hashlib.sha256(b"secret:" + TELEGRAM_BOT_TOKEN.encode()).hexdigest()[:48]
+    if TELEGRAM_BOT_TOKEN else ""
+)
+USE_WEBHOOK = bool(TELEGRAM_BOT_TOKEN and RENDER_EXTERNAL_URL)
 
 SOLD_OUT_KEYWORDS = ("已售完", "完售", "售完")
 ON_SALE_KEYWORDS = ("熱賣中", "立即購票", "購票")
@@ -81,6 +96,35 @@ class _HealthHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def do_POST(self):
+        # Only the Telegram webhook is allowed to POST. Anything else 404.
+        if not WEBHOOK_PATH or self.path != WEBHOOK_PATH:
+            self.send_response(404)
+            self.end_headers()
+            return
+        # Validate Telegram's secret_token header — forged requests with the
+        # right path but no matching header are dropped.
+        if self.headers.get("X-Telegram-Bot-Api-Secret-Token", "") != WEBHOOK_SECRET:
+            self.send_response(403)
+            self.end_headers()
+            return
+        length = int(self.headers.get("Content-Length", "0") or "0")
+        try:
+            raw = self.rfile.read(length).decode("utf-8")
+            update = json.loads(raw) if raw else {}
+        except Exception as e:
+            print(f"[BOT] webhook 解析失敗：{e}")
+            self.send_response(400)
+            self.end_headers()
+            return
+        # ACK immediately so Telegram does not retry; do the actual work
+        # in the background since /check can take 5–10 seconds.
+        self.send_response(200)
+        self.end_headers()
+        threading.Thread(
+            target=_handle_update_safe, args=(update,), daemon=True
+        ).start()
 
     def log_message(self, *args):
         pass
@@ -333,7 +377,16 @@ def _handle_update(update: dict) -> None:
 
     elif cmd == "/pause":
         _config["paused"] = True
-        send_telegram("⏸ 監控已暫停，發送 /resume 繼續")
+        if USE_WEBHOOK:
+            send_telegram(
+                "⏸ <b>監控已暫停</b>\n\n"
+                "已停止 self-ping，約 15 分鐘後 Render 會自動休眠以節省免費額度。\n"
+                "下次發任何指令會自動喚醒（cold start 約 30–60 秒）。\n\n"
+                "⚠️ 喚醒後監控設定（網址/篩選）會保留嗎？\n"
+                "→ <b>不會</b>，記憶體會重設，要重新 /seturl。"
+            )
+        else:
+            send_telegram("⏸ 監控已暫停，發送 /resume 繼續（polling 模式，不會休眠）")
 
     elif cmd == "/resume":
         _config["paused"] = False
@@ -350,11 +403,49 @@ def _handle_update_safe(update: dict) -> None:
         print(f"[BOT] 指令處理錯誤：{e}")
 
 
-def telegram_command_thread() -> None:
+def register_telegram_webhook() -> bool:
+    """Switch the bot to webhook mode so cold-started Render instances
+    can wake up on incoming Telegram messages. Returns True on success."""
+    if not USE_WEBHOOK:
+        return False
+    webhook_url = f"{RENDER_EXTERNAL_URL}{WEBHOOK_PATH}"
+    try:
+        resp = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/setWebhook",
+            json={
+                "url": webhook_url,
+                # Keep pending updates: the message that woke us up during a
+                # cold start is queued by Telegram and must be delivered.
+                "drop_pending_updates": False,
+                "allowed_updates": ["message"],
+                "secret_token": WEBHOOK_SECRET,
+            },
+            timeout=10,
+        )
+        if resp.ok and resp.json().get("ok"):
+            print(f"[BOT] Webhook 註冊成功：{webhook_url}")
+            return True
+        print(f"[BOT] Webhook 註冊失敗：{resp.text}")
+    except Exception as e:
+        print(f"[BOT] Webhook 註冊錯誤：{e}")
+    return False
+
+
+def telegram_polling_thread() -> None:
+    """Long-poll fallback for local development (no RENDER_EXTERNAL_URL)."""
     if not TELEGRAM_BOT_TOKEN:
         return
+    # Clear any webhook so getUpdates is allowed.
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/deleteWebhook",
+            json={"drop_pending_updates": True},
+            timeout=10,
+        )
+    except Exception:
+        pass
     offset = 0
-    print("[BOT] 開始接收 Telegram 指令")
+    print("[BOT] 改用 long-polling 接收 Telegram 指令")
     while True:
         try:
             resp = requests.get(
@@ -429,17 +520,9 @@ def main() -> None:
             notified_idle = False
             print(f"[{now}] 設定已更新，重設票區追蹤狀態")
 
-        # Run self-ping before any standby/paused short-circuit so the Render
-        # free instance keeps receiving traffic and does not spin down,
-        # otherwise the Telegram polling thread would also die and /seturl
-        # could not wake the service back up.
-        if time.time() - last_ping >= 600:
-            self_ping()
-            last_ping = time.time()
-
         if not target_url:
             if not notified_idle:
-                print(f"[{now}] 待機中：尚未設定監控網址")
+                print(f"[{now}] 待機中：尚未設定監控網址（允許 Render 自然 spin down）")
                 notified_idle = True
             time.sleep(CHECK_INTERVAL)
             continue
@@ -447,6 +530,14 @@ def main() -> None:
         if paused:
             time.sleep(CHECK_INTERVAL)
             continue
+
+        # Self-ping only while actively monitoring. In standby / paused state
+        # we deliberately let the Render free instance spin down to save
+        # account-wide free hours. The webhook (POST from Telegram) will cold-
+        # start the service back up when the user sends /resume or /seturl.
+        if time.time() - last_ping >= 600:
+            self_ping()
+            last_ping = time.time()
 
         try:
             zones = check_page(target_url)
@@ -511,6 +602,12 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    # HTTPServer() binds the port synchronously inside __init__ which happens
+    # before serve_forever returns control, so by the time the next statement
+    # runs the socket is already accepting connections.
     threading.Thread(target=start_web_server, daemon=True).start()
-    threading.Thread(target=telegram_command_thread, daemon=True).start()
+    if not register_telegram_webhook():
+        # No RENDER_EXTERNAL_URL (likely local dev) or webhook setup failed:
+        # fall back to long-polling so the bot still works.
+        threading.Thread(target=telegram_polling_thread, daemon=True).start()
     main()

@@ -35,18 +35,30 @@ ON_SALE_KEYWORDS = ("熱賣中", "立即購票", "購票")
 HEADER_KEYWORDS = ("票區", "空位", "區域", "座位", "票種", "類型")
 
 # ---------------------------------------------------------------------------
-# Runtime config — mutated by Telegram commands
+# Runtime config — list of monitors, mutated by Telegram commands
 # ---------------------------------------------------------------------------
-_config: dict = {
-    "target_url": os.getenv("TARGET_URL", "").strip(),
-    "event_name": os.getenv("EVENT_NAME", "").strip(),
-    "watch_zones": [z.strip() for z in os.getenv("WATCH_ZONES", "").split(",") if z.strip()],
-    "paused": False,
-    "url_changed": False,
-}
 
+def _new_monitor(url: str = "", event_name: str = "", watch_zones: list[str] | None = None) -> dict:
+    return {
+        "target_url": url,
+        "event_name": event_name,
+        "watch_zones": watch_zones or [],
+        "paused": False,
+        "zone_status": {},   # tracks per-zone availability for change detection
+    }
+
+
+_monitors: list[dict] = []
+_monitors_lock = threading.RLock()
 _status: dict = {"last_check": "尚未執行", "zones": 0}
-_config_lock = threading.RLock()
+
+_env_url = os.getenv("TARGET_URL", "").strip()
+if _env_url:
+    _monitors.append(_new_monitor(
+        url=_env_url,
+        event_name=os.getenv("EVENT_NAME", "").strip(),
+        watch_zones=[z.strip() for z in os.getenv("WATCH_ZONES", "").split(",") if z.strip()],
+    ))
 
 _session = requests.Session()
 _session.headers.update({
@@ -67,27 +79,22 @@ _session.headers.update({
 # Health endpoint
 # ---------------------------------------------------------------------------
 
-def _event_label() -> str:
-    return _config["event_name"] or "未設定"
-
-
-def _url_label() -> str:
-    return _config["target_url"] or "未設定"
-
-
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
-        if not _config["target_url"]:
-            paused_label = "🟡 待機（未設定網址）"
-        elif _config["paused"]:
-            paused_label = "⏸ 已暫停"
+        with _monitors_lock:
+            monitors = list(_monitors)
+        if not monitors:
+            summary = "🟡 待機（未設定任何監控網址）"
         else:
-            paused_label = "▶ 監控中"
+            lines = []
+            for i, m in enumerate(monitors, 1):
+                state = "⏸" if m["paused"] else "▶"
+                name = m["event_name"] or m["target_url"] or "未設定"
+                zones = "、".join(m["watch_zones"]) if m["watch_zones"] else "全部"
+                lines.append(f"{state} [{i}] {name}（票區：{zones}）")
+            summary = "\n".join(lines)
         body = (
-            f"{paused_label}\n"
-            f"場次：{_event_label()}\n"
-            f"篩選票區：{zones_label}\n"
+            f"{summary}\n"
             f"最後檢查：{_status['last_check']}\n"
             f"追蹤票區：{_status['zones']}"
         ).encode()
@@ -241,19 +248,93 @@ def check_page(url: str) -> list[dict]:
 
 _HELP = (
     "📋 <b>可用指令</b>\n\n"
-    "/check — 立即檢查並回傳當下票況\n"
-    "/seturl 網址 — 設定監控網址\n"
-    "/setevent 場次名稱 — 設定場次顯示名稱\n"
-    "/setzones 關鍵字,關鍵字 — 設定票區篩選（留空=全部）\n"
-    "/status — 顯示目前設定與狀態\n"
-    "/pause — 暫停監控\n"
-    "/resume — 繼續監控\n"
+    "<b>── 監控管理 ──</b>\n"
+    "/addurl 網址 — 新增一場監控\n"
+    "/list — 列出所有監控場次（含編號）\n"
+    "/remove 編號 — 移除指定場次\n\n"
+    "<b>── 場次設定（編號可省略，僅一場時）──</b>\n"
+    "/seturl [編號] 網址 — 更新指定場次的網址\n"
+    "/setevent [編號] 名稱 — 設定場次顯示名稱\n"
+    "/setzones [編號] 關鍵字,關鍵字 — 設定票區篩選（留空=全部）\n\n"
+    "<b>── 操作 ──</b>\n"
+    "/check [編號] — 立即檢查（不填=全部）\n"
+    "/status — 顯示所有場次狀態\n"
+    "/pause [編號] — 暫停（不填=全部）\n"
+    "/resume [編號] — 繼續（不填=全部）\n"
     "/help — 顯示此說明\n\n"
-    "<b>第一次使用流程：</b>\n"
-    "<code>/seturl https://guardians.fami.life/...</code>\n"
-    "<code>/setevent 場次顯示名稱</code>（選填）\n"
-    "<code>/setzones B1層,外野</code>（選填）"
+    "<b>範例（多場）：</b>\n"
+    "<code>/addurl https://guardians.fami.life/...</code>\n"
+    "<code>/setevent 2 週六場</code>\n"
+    "<code>/setzones 2 B區,C區</code>"
 )
+
+
+def _parse_idx_arg(arg: str) -> tuple[int | None, str]:
+    """Split optional 1-based index prefix from arg string.
+    '/setevent 2 週六場' → (1, '週六場');  '/setevent 週六場' → (None, '週六場')
+    Returns (0-based index or None, remaining text).
+    """
+    parts = arg.split(None, 1)
+    if parts and parts[0].isdigit():
+        return int(parts[0]) - 1, (parts[1] if len(parts) > 1 else "")
+    return None, arg
+
+
+def _resolve_monitor(idx: int | None) -> tuple[dict | None, str]:
+    """Return (monitor, error_message). idx is 0-based or None (auto-select if single)."""
+    with _monitors_lock:
+        if not _monitors:
+            return None, "⚠️ 尚未設定任何監控，請先發送 <code>/addurl 網址</code>"
+        if idx is None:
+            if len(_monitors) == 1:
+                return _monitors[0], ""
+            return None, "⚠️ 有多個場次，請加上編號，例如 <code>/check 1</code>\n\n發送 /list 查看編號"
+        if idx < 0 or idx >= len(_monitors):
+            return None, f"⚠️ 編號 {idx + 1} 不存在，發送 /list 查看目前場次"
+        return _monitors[idx], ""
+
+
+def _check_one(monitor: dict) -> None:
+    """Fetch and report ticket availability for a single monitor."""
+    url = monitor["target_url"]
+    event_name = monitor["event_name"] or url
+    watch_zones = monitor["watch_zones"]
+
+    send_telegram(f"🔍 正在檢查 <b>{event_name}</b>，請稍候...")
+    try:
+        zones = check_page(url)
+    except Exception as e:
+        send_telegram(f"❌ <b>檢查失敗</b>（{event_name}）\n\n{e}")
+        return
+
+    if not zones:
+        send_telegram(
+            f"⚠️ <b>未能解析到任何票區資料</b>（{event_name}）\n\n"
+            "頁面已載入但找不到票區。請確認網址正確，且為 fami.life 等"
+            "靜態 HTML 票券頁面（不支援 tsghawks 等 SPA 平台）。"
+        )
+        return
+
+    filtered = [z for z in zones if not watch_zones or any(w in z["name"] for w in watch_zones)]
+    available_count = sum(1 for z in filtered if z["available"])
+    sold_out_count = sum(1 for z in filtered if not z["available"])
+
+    lines = []
+    for z in filtered[:30]:
+        icon = "✅" if z["available"] else "❌"
+        lines.append(f"{icon} {z['name']}（NT${z['price']}）")
+    if len(filtered) > 30:
+        lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    purchase_link = f"\n🔗 <a href='{url}'>立即前往購票</a>" if available_count > 0 else ""
+    send_telegram(
+        f"📋 <b>即時票況｜{event_name}</b>\n\n"
+        + "\n".join(lines)
+        + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
+        f"⏰ {now}"
+        + purchase_link
+    )
 
 
 def _handle_update(update: dict) -> None:
@@ -274,122 +355,192 @@ def _handle_update(update: dict) -> None:
     if cmd in ("/help", "/start"):
         send_telegram(_HELP)
 
-    elif cmd == "/check":
-        if not _config["target_url"]:
-            send_telegram("⚠️ 尚未設定監控網址，請先發送：\n<code>/seturl 網址</code>")
+    elif cmd == "/addurl":
+        if not arg:
+            send_telegram("用法：<code>/addurl 網址</code>")
             return
-        send_telegram("🔍 正在檢查，請稍候...")
-        try:
-            zones = check_page(_config["target_url"])
-        except Exception as e:
-            send_telegram(f"❌ <b>檢查失敗</b>\n\n{e}")
-            return
-
-        if not zones:
-            send_telegram(
-                "⚠️ <b>未能解析到任何票區資料</b>\n\n"
-                "頁面已載入但找不到票區。請確認網址正確，且為 fami.life 等"
-                "靜態 HTML 票券頁面（不支援 tsghawks 等 SPA 平台）。"
-            )
-            return
-
-        current_zones = _config["watch_zones"]
-        filtered = [
-            z for z in zones
-            if not current_zones or any(w in z["name"] for w in current_zones)
-        ]
-
-        available_count = sum(1 for z in filtered if z["available"])
-        sold_out_count = sum(1 for z in filtered if not z["available"])
-
-        lines = []
-        for z in filtered[:30]:
-            icon = "✅" if z["available"] else "❌"
-            lines.append(f"{icon} {z['name']}（NT${z['price']}）")
-        if len(filtered) > 30:
-            lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        purchase_link = (
-            f"\n🔗 <a href='{_config['target_url']}'>立即前往購票</a>"
-            if available_count > 0 else ""
-        )
+        with _monitors_lock:
+            _monitors.append(_new_monitor(url=arg))
+            n = len(_monitors)
         send_telegram(
-            f"📋 <b>即時票況</b>\n\n"
-            + "\n".join(lines)
-            + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
-            f"⏰ {now}"
-            + purchase_link
+            f"✅ <b>已新增監控 [{n}]</b>\n\n{arg}\n\n"
+            f"發送 <code>/setevent {n} 場次名稱</code> 設定顯示名稱（選填）\n"
+            f"發送 <code>/setzones {n} 票區關鍵字</code> 設定篩選（選填）"
         )
+
+    elif cmd == "/list":
+        with _monitors_lock:
+            monitors = list(_monitors)
+        if not monitors:
+            send_telegram("目前沒有任何監控場次。\n\n發送 <code>/addurl 網址</code> 新增。")
+            return
+        lines = []
+        for i, m in enumerate(monitors, 1):
+            state = "⏸" if m["paused"] else "▶️"
+            name = m["event_name"] or "（未命名）"
+            zones = "、".join(m["watch_zones"]) if m["watch_zones"] else "全部"
+            lines.append(f"{state} <b>[{i}]</b> {name}\n     票區：{zones}\n     {m['target_url']}")
+        send_telegram("📋 <b>監控場次列表</b>\n\n" + "\n\n".join(lines))
+
+    elif cmd == "/remove":
+        if not arg or not arg.isdigit():
+            send_telegram("用法：<code>/remove 編號</code>（發送 /list 查看編號）")
+            return
+        idx = int(arg) - 1
+        with _monitors_lock:
+            if idx < 0 or idx >= len(_monitors):
+                send_telegram(f"⚠️ 編號 {idx + 1} 不存在")
+                return
+            removed = _monitors.pop(idx)
+        name = removed["event_name"] or removed["target_url"]
+        send_telegram(f"🗑 已移除監控：{name}")
+
+    elif cmd == "/check":
+        idx, _ = _parse_idx_arg(arg)
+        with _monitors_lock:
+            if not _monitors:
+                send_telegram("⚠️ 尚未設定任何監控，請先發送 <code>/addurl 網址</code>")
+                return
+            if idx is not None:
+                monitor, err = _resolve_monitor(idx)
+                if err:
+                    send_telegram(err)
+                    return
+                targets = [monitor]
+            else:
+                targets = list(_monitors)
+        for m in targets:
+            _check_one(m)
 
     elif cmd == "/seturl":
-        if not arg:
-            send_telegram("用法：<code>/seturl 網址</code>")
-        else:
-            with _config_lock:
-                _config["target_url"] = arg
-                _config["watch_zones"] = []
-                _config["url_changed"] = True
-            send_telegram(
-                f"✅ <b>已更新監控網址</b>\n\n{arg}\n\n"
-                f"票區篩選已重設為「全部」。\n"
-                f"如需自訂場次顯示名稱，發送 <code>/setevent 名稱</code>。"
-            )
+        idx, url = _parse_idx_arg(arg)
+        if not url:
+            send_telegram("用法：<code>/seturl [編號] 網址</code>")
+            return
+        with _monitors_lock:
+            if not _monitors:
+                # Create first monitor automatically
+                _monitors.append(_new_monitor(url=url))
+                n = len(_monitors)
+                send_telegram(
+                    f"✅ <b>已新增監控 [{n}]</b>\n\n{url}\n\n"
+                    f"票區篩選已設為「全部」。"
+                )
+                return
+            monitor, err = _resolve_monitor(idx)
+        if err:
+            send_telegram(err)
+            return
+        with _monitors_lock:
+            monitor["target_url"] = url
+            monitor["watch_zones"] = []
+            monitor["zone_status"] = {}
+        name = monitor["event_name"] or f"監控 {_monitors.index(monitor) + 1}"
+        send_telegram(
+            f"✅ <b>已更新網址</b>（{name}）\n\n{url}\n\n"
+            f"票區篩選已重設為「全部」。"
+        )
 
     elif cmd == "/setevent":
-        if not arg:
-            send_telegram("用法：<code>/setevent 場次名稱</code>")
-        else:
-            with _config_lock:
-                _config["event_name"] = arg
-            send_telegram(f"✅ 場次名稱已更新為：{arg}")
+        idx, name = _parse_idx_arg(arg)
+        if not name:
+            send_telegram("用法：<code>/setevent [編號] 場次名稱</code>")
+            return
+        monitor, err = _resolve_monitor(idx)
+        if err:
+            send_telegram(err)
+            return
+        with _monitors_lock:
+            monitor["event_name"] = name
+        send_telegram(f"✅ 場次名稱已設為：{name}")
 
     elif cmd == "/setzones":
-        if not _config["target_url"]:
+        idx, zones_str = _parse_idx_arg(arg)
+        monitor, err = _resolve_monitor(idx)
+        if err:
+            send_telegram(err)
+            return
+        if not monitor["target_url"]:
             send_telegram("⚠️ 請先用 <code>/seturl</code> 設定監控網址")
             return
-        zones = [z.strip() for z in arg.split(",") if z.strip()]
-        with _config_lock:
-            _config["watch_zones"] = zones
-            _config["url_changed"] = True
+        zones = [z.strip() for z in zones_str.split(",") if z.strip()]
+        with _monitors_lock:
+            monitor["watch_zones"] = zones
+            monitor["zone_status"] = {}
         if zones:
             send_telegram(f"✅ 已設定篩選票區：{'、'.join(zones)}")
         else:
             send_telegram("✅ 已清除篩選，下一輪監控全部票區")
 
     elif cmd == "/status":
-        zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
-        if not _config["target_url"]:
-            state_label = "🟡 待機（未設定網址）"
-        elif _config["paused"]:
-            state_label = "⏸ 已暫停"
-        else:
-            state_label = "▶️ 監控中"
+        with _monitors_lock:
+            monitors = list(_monitors)
+        if not monitors:
+            send_telegram("目前沒有任何監控場次。\n\n發送 <code>/addurl 網址</code> 新增。")
+            return
+        lines = []
+        for i, m in enumerate(monitors, 1):
+            if not m["target_url"]:
+                state = "🟡 待機"
+            elif m["paused"]:
+                state = "⏸ 已暫停"
+            else:
+                state = "▶️ 監控中"
+            name = m["event_name"] or "（未命名）"
+            zones = "、".join(m["watch_zones"]) if m["watch_zones"] else "全部"
+            lines.append(
+                f"<b>[{i}] {name}</b> — {state}\n"
+                f"     票區：{zones}\n"
+                f"     {m['target_url'] or '未設定'}"
+            )
         send_telegram(
-            f"📊 <b>目前狀態</b>\n\n"
-            f"狀態：{state_label}\n"
-            f"場次：{_event_label()}\n"
-            f"篩選票區：{zones_label}\n"
-            f"最後檢查：{_status['last_check']}\n"
-            f"追蹤票區數：{_status['zones']}\n\n"
-            f"🔗 {_url_label()}"
+            f"📊 <b>監控狀態</b>\n\n"
+            + "\n\n".join(lines)
+            + f"\n\n⏰ 最後檢查：{_status['last_check']}"
         )
 
     elif cmd == "/pause":
-        _config["paused"] = True
-        if USE_WEBHOOK:
-            send_telegram(
-                "⏸ <b>監控已暫停</b>\n\n"
-                "已停止 self-ping，約 15 分鐘後 Render 會自動休眠以節省免費額度。\n"
+        idx, _ = _parse_idx_arg(arg)
+        with _monitors_lock:
+            if not _monitors:
+                send_telegram("目前沒有任何監控場次。")
+                return
+            if idx is not None:
+                monitor, err = _resolve_monitor(idx)
+                if err:
+                    send_telegram(err)
+                    return
+                monitor["paused"] = True
+                targets = [monitor]
+            else:
+                for m in _monitors:
+                    m["paused"] = True
+                targets = list(_monitors)
+        names = "、".join(m["event_name"] or f"場次{i+1}" for i, m in enumerate(_monitors) if m in targets)
+        msg_body = f"⏸ <b>已暫停：{names}</b>"
+        if USE_WEBHOOK and idx is None:
+            msg_body += (
+                "\n\n已停止 self-ping，約 15 分鐘後 Render 會自動休眠。\n"
                 "下次發任何指令會自動喚醒（cold start 約 30–60 秒）。\n\n"
-                "⚠️ 喚醒後監控設定（網址/篩選）會保留嗎？\n"
-                "→ <b>不會</b>，記憶體會重設，要重新 /seturl。"
+                "⚠️ 喚醒後設定會重設，需重新 /addurl。"
             )
-        else:
-            send_telegram("⏸ 監控已暫停，發送 /resume 繼續（polling 模式，不會休眠）")
+        send_telegram(msg_body)
 
     elif cmd == "/resume":
-        _config["paused"] = False
+        idx, _ = _parse_idx_arg(arg)
+        with _monitors_lock:
+            if not _monitors:
+                send_telegram("目前沒有任何監控場次。")
+                return
+            if idx is not None:
+                monitor, err = _resolve_monitor(idx)
+                if err:
+                    send_telegram(err)
+                    return
+                monitor["paused"] = False
+            else:
+                for m in _monitors:
+                    m["paused"] = False
         send_telegram("▶️ 監控已繼續")
 
     else:
@@ -408,13 +559,16 @@ def register_bot_commands() -> None:
     if not TELEGRAM_BOT_TOKEN:
         return
     commands = [
-        {"command": "check",    "description": "立即檢查並回傳當下票況"},
-        {"command": "status",   "description": "顯示目前設定與狀態"},
-        {"command": "seturl",   "description": "設定監控網址"},
+        {"command": "addurl",   "description": "新增一場監控"},
+        {"command": "list",     "description": "列出所有監控場次"},
+        {"command": "check",    "description": "立即檢查票況（可加編號）"},
+        {"command": "status",   "description": "顯示所有場次狀態"},
+        {"command": "seturl",   "description": "更新指定場次網址"},
         {"command": "setevent", "description": "設定場次顯示名稱"},
-        {"command": "setzones", "description": "設定票區篩選（逗號分隔，留空=全部）"},
-        {"command": "pause",    "description": "暫停監控"},
-        {"command": "resume",   "description": "繼續監控"},
+        {"command": "setzones", "description": "設定票區篩選（逗號分隔）"},
+        {"command": "remove",   "description": "移除指定場次"},
+        {"command": "pause",    "description": "暫停監控（可加編號）"},
+        {"command": "resume",   "description": "繼續監控（可加編號）"},
         {"command": "help",     "description": "顯示說明"},
     ]
     try:
@@ -496,11 +650,71 @@ def telegram_polling_thread() -> None:
 # Main monitor loop
 # ---------------------------------------------------------------------------
 
+def _check_monitor_once(monitor: dict, now: str) -> None:
+    """Run one monitoring cycle for a single monitor (called from main loop)."""
+    target_url = monitor["target_url"]
+    current_zones = monitor["watch_zones"]
+    event_name = monitor["event_name"] or target_url
+    zone_status = monitor["zone_status"]
+
+    try:
+        zones = check_page(target_url)
+
+        if not zones:
+            print(f"[{now}] [{event_name}] [WARN] 未解析到票區資料")
+            return
+
+        newly_available: list[dict] = []
+        already_available: list[dict] = []
+
+        for zone in zones:
+            name = zone["name"]
+            if current_zones and not any(w in name for w in current_zones):
+                continue
+
+            avail = zone["available"]
+            prev = zone_status.get(name)
+            status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
+            print(f"[{now}] [{event_name}] {name} ｜ NT${zone['price']} ｜ {status_label}")
+
+            if prev is None and avail:
+                already_available.append(zone)
+            elif prev is not None and not prev and avail:
+                newly_available.append(zone)
+
+            zone_status[name] = avail
+
+        if already_available:
+            lines = "\n".join(
+                f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                for z in already_available
+            )
+            send_telegram(
+                f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
+                f"<b>{event_name}</b>\n\n{lines}\n\n"
+                f"🔗 <a href='{target_url}'>立即前往購票</a>"
+            )
+
+        if newly_available:
+            lines = "\n".join(
+                f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                for z in newly_available
+            )
+            send_telegram(
+                f"🎫 <b>票券釋出通知！</b>\n\n"
+                f"<b>{event_name}</b>\n\n"
+                f"以下票區有票可購買：\n{lines}\n\n"
+                f"🔗 <a href='{target_url}'>立即前往購票</a>\n\n"
+                f"⏰ 偵測時間：{now}"
+            )
+            print(f"[{now}] [{event_name}] Telegram 通知已發送（{len(newly_available)} 個票區）")
+
+    except Exception as e:
+        print(f"[{now}] [{event_name}] [ERROR] {e}")
+
+
 def main() -> None:
-    zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
-    print(f"[監控啟動] {_event_label()}")
-    print(f"[目標 URL] {_url_label()}")
-    print(f"[篩選票區] {zones_label}")
+    print(f"[監控啟動] 共 {len(_monitors)} 個場次")
     print(f"[檢查間隔] 每 {CHECK_INTERVAL} 秒")
     print("-" * 60)
 
@@ -508,123 +722,60 @@ def main() -> None:
         print("[警告] 未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，不會發送通知")
         print("-" * 60)
 
-    if _config["target_url"]:
+    with _monitors_lock:
+        initial_monitors = list(_monitors)
+
+    if initial_monitors:
+        lines = "\n".join(
+            f"• {m['event_name'] or m['target_url']}" for m in initial_monitors
+        )
         send_telegram(
             f"✅ <b>票券監控已啟動</b>\n\n"
-            f"場次：{_event_label()}\n"
-            f"篩選票區：{zones_label}\n"
+            f"共 {len(initial_monitors)} 個監控場次：\n{lines}\n\n"
             f"檢查間隔：每 {CHECK_INTERVAL} 秒\n\n"
-            f"🔗 {_config['target_url']}\n\n"
             f"發送 /help 查看可用指令"
         )
     else:
         send_telegram(
             "🟡 <b>票券監控待機中</b>\n\n"
             "尚未設定監控網址，請先發送：\n"
-            "<code>/seturl 網址</code>\n\n"
+            "<code>/addurl 網址</code>\n\n"
             "發送 /help 查看所有指令"
         )
 
-    zone_status: dict[str, bool | None] = {}
-    last_url = _config["target_url"]
     last_ping = 0.0
     notified_idle = False
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        with _config_lock:
-            target_url = _config["target_url"]
-            current_zones = list(_config["watch_zones"])
-            paused = _config["paused"]
-            url_changed = _config["url_changed"]
-            event_name = _config["event_name"] or "未設定"
-            if url_changed:
-                _config["url_changed"] = False
+        with _monitors_lock:
+            active = [m for m in _monitors if m["target_url"] and not m["paused"]]
 
-        if url_changed or target_url != last_url:
-            zone_status.clear()
-            last_url = target_url
-            notified_idle = False
-            print(f"[{now}] 設定已更新，重設票區追蹤狀態")
-
-        if not target_url:
+        if not active:
             if not notified_idle:
-                print(f"[{now}] 待機中：尚未設定監控網址（允許 Render 自然 spin down）")
+                print(f"[{now}] 待機中：無啟用中的監控（允許 Render 自然 spin down）")
                 notified_idle = True
             time.sleep(CHECK_INTERVAL)
             continue
 
-        if paused:
-            time.sleep(CHECK_INTERVAL)
-            continue
+        notified_idle = False
 
         # Self-ping only while actively monitoring. In standby / paused state
         # we deliberately let the Render free instance spin down to save
         # account-wide free hours. The webhook (POST from Telegram) will cold-
-        # start the service back up when the user sends /resume or /seturl.
+        # start the service back up when the user sends /resume or /addurl.
         if time.time() - last_ping >= 600:
             self_ping()
             last_ping = time.time()
 
-        try:
-            zones = check_page(target_url)
+        total_zones = 0
+        for monitor in active:
+            _check_monitor_once(monitor, now)
+            total_zones += len(monitor["zone_status"])
 
-            if not zones:
-                print(f"[{now}] [WARN] 未解析到票區資料。網址可能不是支援的票券頁面。")
-                time.sleep(CHECK_INTERVAL)
-                continue
-
-            _status["last_check"] = now
-            _status["zones"] = len(zones)
-
-            newly_available: list[dict] = []
-            already_available: list[dict] = []
-
-            for zone in zones:
-                name = zone["name"]
-                if current_zones and not any(w in name for w in current_zones):
-                    continue
-
-                avail = zone["available"]
-                prev = zone_status.get(name)
-                status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
-                print(f"[{now}] {name} ｜ NT${zone['price']} ｜ {status_label}")
-
-                if prev is None and avail:
-                    already_available.append(zone)
-                elif prev is not None and not prev and avail:
-                    newly_available.append(zone)
-
-                zone_status[name] = avail
-
-            if already_available:
-                lines = "\n".join(
-                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
-                    for z in already_available
-                )
-                send_telegram(
-                    f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
-                    f"<b>{event_name}</b>\n\n{lines}\n\n"
-                    f"🔗 <a href='{target_url}'>立即前往購票</a>"
-                )
-
-            if newly_available:
-                lines = "\n".join(
-                    f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
-                    for z in newly_available
-                )
-                send_telegram(
-                    f"🎫 <b>票券釋出通知！</b>\n\n"
-                    f"<b>{event_name}</b>\n\n"
-                    f"以下票區有票可購買：\n{lines}\n\n"
-                    f"🔗 <a href='{target_url}'>立即前往購票</a>\n\n"
-                    f"⏰ 偵測時間：{now}"
-                )
-                print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
-
-        except Exception as e:
-            print(f"[{now}] [ERROR] {e}")
+        _status["last_check"] = now
+        _status["zones"] = total_zones
 
         time.sleep(CHECK_INTERVAL)
 

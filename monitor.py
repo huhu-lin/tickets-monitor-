@@ -115,6 +115,7 @@ def self_ping() -> None:
 
 _HELP = (
     "📋 <b>可用指令</b>\n\n"
+    "/check — 立即檢查並回傳當下票況\n"
     "/seturl 網址 — 設定監控網址\n"
     "/setzones 關鍵字,關鍵字 — 設定票區篩選（留空=全部）\n"
     "/status — 顯示目前設定與狀態\n"
@@ -144,6 +145,50 @@ def _handle_update(update: dict) -> None:
 
     if cmd == "/help":
         send_telegram(_HELP)
+
+    elif cmd == "/check":
+        send_telegram("🔍 正在檢查，請稍候...")
+        try:
+            zones = check_page(_config["target_url"])
+        except Exception as e:
+            send_telegram(
+                f"❌ <b>檢查失敗</b>\n\n{e}\n\n"
+                f"⚠️ 此網站可能需要瀏覽器才能載入（JavaScript 渲染），"
+                f"requests 模式無法抓取。"
+            )
+            return
+
+        if not zones:
+            send_telegram(
+                "⚠️ <b>未能解析到任何票區資料</b>\n\n"
+                "網站可能為 JavaScript 渲染（SPA），requests 模式無法取得資料。\n"
+                "建議改用 Docker 部署方式。"
+            )
+            return
+
+        current_zones = _config["watch_zones"]
+        filtered = [
+            z for z in zones
+            if not current_zones or any(w in z["name"] for w in current_zones)
+        ]
+
+        available_count = sum(1 for z in filtered if z["available"])
+        sold_out_count = sum(1 for z in filtered if not z["available"])
+
+        lines = []
+        for z in filtered[:30]:
+            icon = "✅" if z["available"] else "❌"
+            lines.append(f"{icon} {z['name']}（NT${z['price']}）")
+        if len(filtered) > 30:
+            lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        send_telegram(
+            f"📋 <b>即時票況</b>\n\n"
+            + "\n".join(lines)
+            + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
+            f"⏰ {now}"
+        )
 
     elif cmd == "/seturl":
         if not arg:

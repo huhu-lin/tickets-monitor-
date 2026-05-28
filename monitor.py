@@ -1,12 +1,12 @@
 import os
-import queue
+import re
 import threading
 import time
 import requests
+from bs4 import BeautifulSoup
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
@@ -14,6 +14,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "60"))
 RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
+
+SOLD_OUT_KEYWORDS = ("已售完", "完售", "售完")
+ON_SALE_KEYWORDS = ("熱賣中", "立即購票", "購票")
+HEADER_KEYWORDS = ("票區", "空位", "區域", "座位", "票種", "類型")
 
 # ---------------------------------------------------------------------------
 # Runtime config — mutated by Telegram commands
@@ -28,6 +32,20 @@ _config: dict = {
 
 _status: dict = {"last_check": "尚未執行", "zones": 0}
 _config_lock = threading.RLock()
+
+_session = requests.Session()
+_session.headers.update({
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -103,126 +121,74 @@ def self_ping() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Page scraping — single Playwright worker thread (sync_playwright is NOT
-# thread-safe; all browser interactions must happen inside one OS thread).
+# Page scraping — static HTML for fami.life-style (utiki) ticket pages.
+# Table row layout: ['', '票區名稱', '票價', '空位 (數字 / 售完 / 熱賣中)']
+# The empty first cell is the gotcha that broke the previous attempt.
+# Logic ported from /Users/linzhanhu/清票監控/scrapers/utiki.py.
 # ---------------------------------------------------------------------------
 
-_JS_EXTRACT = r"""
-() => {
-    const zones = [];
+def _parse_zones(html: str) -> list[dict]:
+    soup = BeautifulSoup(html, "lxml")
+    zones: list[dict] = []
 
-    // Strategy 1: standard <table>
-    const rows = document.querySelectorAll('table tr');
-    for (const row of rows) {
-        const cells = row.querySelectorAll('td');
-        if (cells.length < 3) continue;
-        const name   = (cells[0].innerText || '').trim();
-        const price  = (cells[1].innerText || '').trim().replace(/[^\d]/g, '');
-        const status = (cells[2].innerText || '').trim();
-        if (name.length > 1 && price && (status === '售完' || /^\d+$/.test(status))) {
-            zones.push({ name, price, status });
-        }
-    }
-    if (zones.length > 0) return zones;
+    for row in soup.select("table tr"):
+        cells = row.find_all(["td", "th"])
+        if len(cells) < 2:
+            continue
 
-    // Strategy 2: div-based layout — find leaf "售完" nodes, walk up
-    const leaves = Array.from(document.querySelectorAll('*'))
-        .filter(el => !el.children.length && (el.innerText || '').trim() === '售完');
-    for (const el of leaves) {
-        let p = el.parentElement;
-        for (let d = 0; d < 6 && p; d++, p = p.parentElement) {
-            const kids = Array.from(p.children)
-                .map(c => (c.innerText || '').trim())
-                .filter(Boolean);
-            if (kids.length >= 3) {
-                const name   = kids[0];
-                const status = kids[kids.length - 1];
-                const price  = kids.find(t => /^\d{3,5}$/.test(t)) || '';
-                if (name.length > 2 && price && (status === '售完' || /^\d+$/.test(status))) {
-                    zones.push({ name, price, status });
-                    break;
-                }
-            }
-        }
-    }
+        cell_texts = [c.get_text(strip=True) for c in cells]
+        # Skip header rows
+        if cells[0].name == "th" or any(kw in " ".join(cell_texts) for kw in HEADER_KEYWORDS):
+            continue
 
-    return zones;
-}
-"""
+        # Name is in cell[1] when first column is empty (fami.life layout),
+        # otherwise in cell[0].
+        name = cell_texts[1] if len(cell_texts) >= 2 and cell_texts[0] == "" else cell_texts[0]
+        if not name or len(name) < 2:
+            continue
 
-_scraper_request_q: "queue.Queue[tuple[str, queue.Queue]]" = queue.Queue()
-_scraper_ready = threading.Event()
-_scraper_dead = threading.Event()
-_scraper_error: list[str] = []
+        last_cell = cell_texts[-1]
 
+        # Find price (>= 100 to avoid picking up tiny counts)
+        price = ""
+        price_idx = 2 if len(cell_texts) >= 4 and cell_texts[0] == "" else 1
+        if price_idx < len(cell_texts):
+            price_text = cell_texts[price_idx].replace(",", "")
+            if re.fullmatch(r"\d+", price_text) and int(price_text) >= 100:
+                price = price_text
 
-def _scraper_worker() -> None:
-    try:
-        with sync_playwright() as pw:
-            browser = pw.chromium.launch(headless=True)
-            _scraper_ready.set()
-            print("[SCRAPER] Playwright worker 就緒")
-            while True:
-                url, reply_q = _scraper_request_q.get()
-                try:
-                    context = browser.new_context(
-                        user_agent=(
-                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                            "AppleWebKit/537.36 (KHTML, like Gecko) "
-                            "Chrome/124.0.0.0 Safari/537.36"
-                        ),
-                        locale="zh-TW",
-                    )
-                    page = context.new_page()
-                    try:
-                        page.goto(url, wait_until="networkidle", timeout=30000)
-                        raw = page.evaluate(_JS_EXTRACT)
-                        zones = [
-                            {**z, "available": z["status"] != "售完"}
-                            for z in raw
-                            if z.get("name") and len(z["name"]) >= 2
-                        ]
-                        reply_q.put(("ok", zones))
-                    finally:
-                        try:
-                            page.close()
-                        except Exception:
-                            pass
-                        context.close()
-                except Exception as e:
-                    reply_q.put(("err", e))
-    except Exception as e:
-        _scraper_error.append(str(e))
-        _scraper_dead.set()
-        _scraper_ready.set()
-        print(f"[SCRAPER] worker 異常結束：{e}")
-        # Drain pending requests so callers don't hang forever
-        while True:
-            try:
-                _, reply_q = _scraper_request_q.get_nowait()
-                reply_q.put(("err", RuntimeError(f"Playwright worker 已停止：{e}")))
-            except queue.Empty:
-                break
+        count_match = re.fullmatch(r"(\d+)", last_cell)
+        if count_match:
+            remaining = int(count_match.group(1))
+            available = remaining > 0
+            status = str(remaining) if available else "售完"
+        elif any(kw in last_cell for kw in SOLD_OUT_KEYWORDS):
+            available = False
+            status = "售完"
+        elif "熱賣中" in last_cell or any(kw in last_cell for kw in ON_SALE_KEYWORDS):
+            available = True
+            status = "熱賣中"
+        else:
+            # Unknown status text — skip rather than misreport
+            continue
+
+        zones.append({
+            "name": name,
+            "price": price or "—",
+            "status": status,
+            "available": available,
+        })
+
+    return zones
 
 
 def check_page(url: str) -> list[dict]:
-    if _scraper_dead.is_set():
-        msg = _scraper_error[0] if _scraper_error else "未知原因"
-        raise RuntimeError(f"Playwright worker 已停止運作：{msg}")
-    if not _scraper_ready.wait(timeout=60):
-        raise RuntimeError("Playwright worker 尚未就緒")
-    if _scraper_dead.is_set():
-        msg = _scraper_error[0] if _scraper_error else "未知原因"
-        raise RuntimeError(f"Playwright worker 已停止運作：{msg}")
-    reply_q: queue.Queue = queue.Queue(maxsize=1)
-    _scraper_request_q.put((url, reply_q))
-    try:
-        kind, payload = reply_q.get(timeout=90)
-    except queue.Empty:
-        raise RuntimeError("檢查逾時（90 秒）")
-    if kind == "err":
-        raise payload
-    return payload
+    """Fetch the ticket page and return per-zone availability list."""
+    headers = {"Referer": f"https://{url.split('/')[2]}/" if "://" in url else ""}
+    resp = _session.get(url, headers={k: v for k, v in headers.items() if v}, timeout=20)
+    if resp.status_code != 200:
+        raise RuntimeError(f"HTTP {resp.status_code}")
+    return _parse_zones(resp.text)
 
 
 # ---------------------------------------------------------------------------
@@ -240,7 +206,7 @@ _HELP = (
     "/resume — 繼續監控\n"
     "/help — 顯示此說明\n\n"
     "<b>第一次使用流程：</b>\n"
-    "<code>/seturl https://...</code>\n"
+    "<code>/seturl https://guardians.fami.life/...</code>\n"
     "<code>/setevent 場次顯示名稱</code>（選填）\n"
     "<code>/setzones B1層,外野</code>（選填）"
 )
@@ -261,7 +227,7 @@ def _handle_update(update: dict) -> None:
     cmd = parts[0].lower().split("@")[0]
     arg = parts[1].strip() if len(parts) > 1 else ""
 
-    if cmd == "/help" or cmd == "/start":
+    if cmd in ("/help", "/start"):
         send_telegram(_HELP)
 
     elif cmd == "/check":
@@ -278,7 +244,8 @@ def _handle_update(update: dict) -> None:
         if not zones:
             send_telegram(
                 "⚠️ <b>未能解析到任何票區資料</b>\n\n"
-                "頁面已載入但找不到票區，請確認網址是否正確。"
+                "頁面已載入但找不到票區。請確認網址正確，且為 fami.life 等"
+                "靜態 HTML 票券頁面（不支援 tsghawks 等 SPA 平台）。"
             )
             return
 
@@ -393,8 +360,6 @@ def telegram_command_thread() -> None:
             if resp.ok:
                 for update in resp.json().get("result", []):
                     offset = update["update_id"] + 1
-                    # Run each update in its own thread so /check (which can
-                    # block 30–90s on Playwright) does not stall the long-poll.
                     threading.Thread(
                         target=_handle_update_safe, args=(update,), daemon=True
                     ).start()
@@ -444,7 +409,6 @@ def main() -> None:
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # Snapshot config under lock so all reads within this iteration agree.
         with _config_lock:
             target_url = _config["target_url"]
             current_zones = list(_config["watch_zones"])
@@ -479,14 +443,12 @@ def main() -> None:
             zones = check_page(target_url)
 
             if not zones:
-                print(f"[{now}] [WARN] 未解析到票區資料，請確認網址是否正確。")
+                print(f"[{now}] [WARN] 未解析到票區資料。網址可能不是支援的票券頁面。")
                 time.sleep(CHECK_INTERVAL)
                 continue
 
             _status["last_check"] = now
             _status["zones"] = len(zones)
-
-            current_url = target_url
 
             newly_available: list[dict] = []
             already_available: list[dict] = []
@@ -516,7 +478,7 @@ def main() -> None:
                 send_telegram(
                     f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
                     f"<b>{event_name}</b>\n\n{lines}\n\n"
-                    f"🔗 <a href='{current_url}'>立即前往購票</a>"
+                    f"🔗 <a href='{target_url}'>立即前往購票</a>"
                 )
 
             if newly_available:
@@ -528,7 +490,7 @@ def main() -> None:
                     f"🎫 <b>票券釋出通知！</b>\n\n"
                     f"<b>{event_name}</b>\n\n"
                     f"以下票區有票可購買：\n{lines}\n\n"
-                    f"🔗 <a href='{current_url}'>立即前往購票</a>\n\n"
+                    f"🔗 <a href='{target_url}'>立即前往購票</a>\n\n"
                     f"⏰ 偵測時間：{now}"
                 )
                 print(f"[{now}] Telegram 通知已發送（{len(newly_available)} 個票區）")
@@ -541,6 +503,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
-    threading.Thread(target=_scraper_worker, daemon=True).start()
     threading.Thread(target=telegram_command_thread, daemon=True).start()
     main()

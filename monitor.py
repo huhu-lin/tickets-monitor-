@@ -1,11 +1,12 @@
 import os
+import queue
 import threading
 import time
 import requests
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright, Browser, Playwright as SyncPlaywright
+from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
@@ -18,43 +19,41 @@ RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "")
 # Runtime config — mutated by Telegram commands
 # ---------------------------------------------------------------------------
 _config: dict = {
-    "target_url": os.getenv(
-        "TARGET_URL",
-        "https://guardians.fami.life/UTK0204_?PERFORMANCE_ID=P19LRRQA&PRODUCT_ID=P15UU08Q",
-    ),
-    "event_name": os.getenv("EVENT_NAME", "Guardians UTK0204"),
+    "target_url": os.getenv("TARGET_URL", "").strip(),
+    "event_name": os.getenv("EVENT_NAME", "").strip(),
     "watch_zones": [z.strip() for z in os.getenv("WATCH_ZONES", "").split(",") if z.strip()],
     "paused": False,
     "url_changed": False,
 }
 
 _status: dict = {"last_check": "尚未執行", "zones": 0}
+_config_lock = threading.RLock()
 
-_pw: SyncPlaywright | None = None
-_browser: Browser | None = None
-_browser_lock = threading.Lock()
-
-
-def _get_browser() -> Browser:
-    global _pw, _browser
-    with _browser_lock:
-        if _browser is None or not _browser.is_connected():
-            if _pw is None:
-                _pw = sync_playwright().start()
-            _browser = _pw.chromium.launch(headless=True)
-    return _browser
 
 # ---------------------------------------------------------------------------
 # Health endpoint
 # ---------------------------------------------------------------------------
 
+def _event_label() -> str:
+    return _config["event_name"] or "未設定"
+
+
+def _url_label() -> str:
+    return _config["target_url"] or "未設定"
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
-        paused_label = "⏸ 已暫停" if _config["paused"] else "▶ 監控中"
+        if not _config["target_url"]:
+            paused_label = "🟡 待機（未設定網址）"
+        elif _config["paused"]:
+            paused_label = "⏸ 已暫停"
+        else:
+            paused_label = "▶ 監控中"
         body = (
             f"{paused_label}\n"
-            f"場次：{_config['event_name']}\n"
+            f"場次：{_event_label()}\n"
             f"篩選票區：{zones_label}\n"
             f"最後檢查：{_status['last_check']}\n"
             f"追蹤票區：{_status['zones']}"
@@ -104,155 +103,8 @@ def self_ping() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Telegram command handling
-# ---------------------------------------------------------------------------
-
-_HELP = (
-    "📋 <b>可用指令</b>\n\n"
-    "/check — 立即檢查並回傳當下票況\n"
-    "/seturl 網址 — 設定監控網址\n"
-    "/setzones 關鍵字,關鍵字 — 設定票區篩選（留空=全部）\n"
-    "/status — 顯示目前設定與狀態\n"
-    "/pause — 暫停監控\n"
-    "/resume — 繼續監控\n"
-    "/help — 顯示此說明\n\n"
-    "範例：\n"
-    "<code>/setzones B1層,外野</code>\n"
-    "<code>/setzones</code>（清除篩選，監控全部）"
-)
-
-
-def _handle_update(update: dict) -> None:
-    msg = update.get("message") or update.get("edited_message") or {}
-    chat_id = str(msg.get("chat", {}).get("id", ""))
-
-    if chat_id != str(TELEGRAM_CHAT_ID):
-        return
-
-    text = (msg.get("text") or "").strip()
-    if not text.startswith("/"):
-        return
-
-    parts = text.split(None, 1)
-    cmd = parts[0].lower().split("@")[0]
-    arg = parts[1].strip() if len(parts) > 1 else ""
-
-    if cmd == "/help":
-        send_telegram(_HELP)
-
-    elif cmd == "/check":
-        send_telegram("🔍 正在檢查，請稍候...")
-        try:
-            zones = check_page(_config["target_url"])
-        except Exception as e:
-            send_telegram(
-                f"❌ <b>檢查失敗</b>\n\n{e}\n\n"
-                f"⚠️ 此網站可能需要瀏覽器才能載入（JavaScript 渲染），"
-                f"requests 模式無法抓取。"
-            )
-            return
-
-        if not zones:
-            send_telegram("⚠️ <b>未能解析到任何票區資料</b>\n\n頁面載入完成但找不到票區，請確認網址是否正確。")
-            return
-
-        current_zones = _config["watch_zones"]
-        filtered = [
-            z for z in zones
-            if not current_zones or any(w in z["name"] for w in current_zones)
-        ]
-
-        available_count = sum(1 for z in filtered if z["available"])
-        sold_out_count = sum(1 for z in filtered if not z["available"])
-
-        lines = []
-        for z in filtered[:30]:
-            icon = "✅" if z["available"] else "❌"
-            lines.append(f"{icon} {z['name']}（NT${z['price']}）")
-        if len(filtered) > 30:
-            lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
-
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        send_telegram(
-            f"📋 <b>即時票況</b>\n\n"
-            + "\n".join(lines)
-            + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
-            f"⏰ {now}"
-        )
-
-    elif cmd == "/seturl":
-        if not arg:
-            send_telegram("用法：/seturl 網址\n例如：\n<code>/seturl https://guardians.fami.life/...</code>")
-        else:
-            _config["target_url"] = arg
-            _config["event_name"] = "自訂場次"
-            _config["watch_zones"] = []
-            _config["url_changed"] = True
-            send_telegram(
-                f"✅ <b>已更新監控網址</b>\n\n{arg}\n\n"
-                f"票區篩選已重設為「全部」，下一輪開始監控新場次。"
-            )
-
-    elif cmd == "/setzones":
-        zones = [z.strip() for z in arg.split(",") if z.strip()]
-        _config["watch_zones"] = zones
-        _config["url_changed"] = True
-        if zones:
-            send_telegram(f"✅ 已設定篩選票區：{'、'.join(zones)}")
-        else:
-            send_telegram("✅ 已清除篩選，下一輪監控全部票區")
-
-    elif cmd == "/status":
-        zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
-        paused_label = "⏸ 已暫停" if _config["paused"] else "▶️ 監控中"
-        send_telegram(
-            f"📊 <b>目前狀態</b>\n\n"
-            f"狀態：{paused_label}\n"
-            f"場次：{_config['event_name']}\n"
-            f"篩選票區：{zones_label}\n"
-            f"最後檢查：{_status['last_check']}\n"
-            f"追蹤票區數：{_status['zones']}\n\n"
-            f"🔗 {_config['target_url']}"
-        )
-
-    elif cmd == "/pause":
-        _config["paused"] = True
-        send_telegram("⏸ 監控已暫停，發送 /resume 繼續")
-
-    elif cmd == "/resume":
-        _config["paused"] = False
-        send_telegram("▶️ 監控已繼續")
-
-    else:
-        send_telegram(f"未知指令：{cmd}\n\n{_HELP}")
-
-
-def telegram_command_thread() -> None:
-    if not TELEGRAM_BOT_TOKEN:
-        return
-    offset = 0
-    print("[BOT] 開始接收 Telegram 指令")
-    while True:
-        try:
-            resp = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params={"timeout": 30, "offset": offset, "allowed_updates": ["message"]},
-                timeout=35,
-            )
-            if resp.ok:
-                for update in resp.json().get("result", []):
-                    offset = update["update_id"] + 1
-                    try:
-                        _handle_update(update)
-                    except Exception as e:
-                        print(f"[BOT] 指令處理錯誤：{e}")
-        except Exception as e:
-            print(f"[BOT] 輪詢錯誤：{e}")
-            time.sleep(5)
-
-
-# ---------------------------------------------------------------------------
-# Page scraping — Playwright (handles JS-rendered SPA)
+# Page scraping — single Playwright worker thread (sync_playwright is NOT
+# thread-safe; all browser interactions must happen inside one OS thread).
 # ---------------------------------------------------------------------------
 
 _JS_EXTRACT = r"""
@@ -298,32 +150,267 @@ _JS_EXTRACT = r"""
 }
 """
 
+_scraper_request_q: "queue.Queue[tuple[str, queue.Queue]]" = queue.Queue()
+_scraper_ready = threading.Event()
+_scraper_dead = threading.Event()
+_scraper_error: list[str] = []
+
+
+def _scraper_worker() -> None:
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            _scraper_ready.set()
+            print("[SCRAPER] Playwright worker 就緒")
+            while True:
+                url, reply_q = _scraper_request_q.get()
+                try:
+                    context = browser.new_context(
+                        user_agent=(
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) "
+                            "Chrome/124.0.0.0 Safari/537.36"
+                        ),
+                        locale="zh-TW",
+                    )
+                    page = context.new_page()
+                    try:
+                        page.goto(url, wait_until="networkidle", timeout=30000)
+                        raw = page.evaluate(_JS_EXTRACT)
+                        zones = [
+                            {**z, "available": z["status"] != "售完"}
+                            for z in raw
+                            if z.get("name") and len(z["name"]) >= 2
+                        ]
+                        reply_q.put(("ok", zones))
+                    finally:
+                        try:
+                            page.close()
+                        except Exception:
+                            pass
+                        context.close()
+                except Exception as e:
+                    reply_q.put(("err", e))
+    except Exception as e:
+        _scraper_error.append(str(e))
+        _scraper_dead.set()
+        _scraper_ready.set()
+        print(f"[SCRAPER] worker 異常結束：{e}")
+        # Drain pending requests so callers don't hang forever
+        while True:
+            try:
+                _, reply_q = _scraper_request_q.get_nowait()
+                reply_q.put(("err", RuntimeError(f"Playwright worker 已停止：{e}")))
+            except queue.Empty:
+                break
+
 
 def check_page(url: str) -> list[dict]:
-    """Render the ticket page with Playwright and extract per-zone availability."""
-    browser = _get_browser()
-    page = browser.new_page()
+    if _scraper_dead.is_set():
+        msg = _scraper_error[0] if _scraper_error else "未知原因"
+        raise RuntimeError(f"Playwright worker 已停止運作：{msg}")
+    if not _scraper_ready.wait(timeout=60):
+        raise RuntimeError("Playwright worker 尚未就緒")
+    if _scraper_dead.is_set():
+        msg = _scraper_error[0] if _scraper_error else "未知原因"
+        raise RuntimeError(f"Playwright worker 已停止運作：{msg}")
+    reply_q: queue.Queue = queue.Queue(maxsize=1)
+    _scraper_request_q.put((url, reply_q))
     try:
-        page.set_extra_http_headers({"Accept-Language": "zh-TW,zh;q=0.9"})
-        page.goto(url, wait_until="networkidle", timeout=30000)
-        raw: list[dict] = page.evaluate(_JS_EXTRACT)
-        return [
-            {**z, "available": z["status"] != "售完"}
-            for z in raw
-            if z.get("name") and len(z["name"]) >= 2
-        ]
-    finally:
-        page.close()
+        kind, payload = reply_q.get(timeout=90)
+    except queue.Empty:
+        raise RuntimeError("檢查逾時（90 秒）")
+    if kind == "err":
+        raise payload
+    return payload
 
 
 # ---------------------------------------------------------------------------
-# Main monitor loop (synchronous — no asyncio needed without Playwright)
+# Telegram command handling
+# ---------------------------------------------------------------------------
+
+_HELP = (
+    "📋 <b>可用指令</b>\n\n"
+    "/check — 立即檢查並回傳當下票況\n"
+    "/seturl 網址 — 設定監控網址\n"
+    "/setevent 場次名稱 — 設定場次顯示名稱\n"
+    "/setzones 關鍵字,關鍵字 — 設定票區篩選（留空=全部）\n"
+    "/status — 顯示目前設定與狀態\n"
+    "/pause — 暫停監控\n"
+    "/resume — 繼續監控\n"
+    "/help — 顯示此說明\n\n"
+    "<b>第一次使用流程：</b>\n"
+    "<code>/seturl https://...</code>\n"
+    "<code>/setevent 場次顯示名稱</code>（選填）\n"
+    "<code>/setzones B1層,外野</code>（選填）"
+)
+
+
+def _handle_update(update: dict) -> None:
+    msg = update.get("message") or update.get("edited_message") or {}
+    chat_id = str(msg.get("chat", {}).get("id", ""))
+
+    if chat_id != str(TELEGRAM_CHAT_ID):
+        return
+
+    text = (msg.get("text") or "").strip()
+    if not text.startswith("/"):
+        return
+
+    parts = text.split(None, 1)
+    cmd = parts[0].lower().split("@")[0]
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd == "/help" or cmd == "/start":
+        send_telegram(_HELP)
+
+    elif cmd == "/check":
+        if not _config["target_url"]:
+            send_telegram("⚠️ 尚未設定監控網址，請先發送：\n<code>/seturl 網址</code>")
+            return
+        send_telegram("🔍 正在檢查，請稍候...")
+        try:
+            zones = check_page(_config["target_url"])
+        except Exception as e:
+            send_telegram(f"❌ <b>檢查失敗</b>\n\n{e}")
+            return
+
+        if not zones:
+            send_telegram(
+                "⚠️ <b>未能解析到任何票區資料</b>\n\n"
+                "頁面已載入但找不到票區，請確認網址是否正確。"
+            )
+            return
+
+        current_zones = _config["watch_zones"]
+        filtered = [
+            z for z in zones
+            if not current_zones or any(w in z["name"] for w in current_zones)
+        ]
+
+        available_count = sum(1 for z in filtered if z["available"])
+        sold_out_count = sum(1 for z in filtered if not z["available"])
+
+        lines = []
+        for z in filtered[:30]:
+            icon = "✅" if z["available"] else "❌"
+            lines.append(f"{icon} {z['name']}（NT${z['price']}）")
+        if len(filtered) > 30:
+            lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
+
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        send_telegram(
+            f"📋 <b>即時票況</b>\n\n"
+            + "\n".join(lines)
+            + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
+            f"⏰ {now}"
+        )
+
+    elif cmd == "/seturl":
+        if not arg:
+            send_telegram("用法：<code>/seturl 網址</code>")
+        else:
+            with _config_lock:
+                _config["target_url"] = arg
+                _config["watch_zones"] = []
+                _config["url_changed"] = True
+            send_telegram(
+                f"✅ <b>已更新監控網址</b>\n\n{arg}\n\n"
+                f"票區篩選已重設為「全部」。\n"
+                f"如需自訂場次顯示名稱，發送 <code>/setevent 名稱</code>。"
+            )
+
+    elif cmd == "/setevent":
+        if not arg:
+            send_telegram("用法：<code>/setevent 場次名稱</code>")
+        else:
+            with _config_lock:
+                _config["event_name"] = arg
+            send_telegram(f"✅ 場次名稱已更新為：{arg}")
+
+    elif cmd == "/setzones":
+        if not _config["target_url"]:
+            send_telegram("⚠️ 請先用 <code>/seturl</code> 設定監控網址")
+            return
+        zones = [z.strip() for z in arg.split(",") if z.strip()]
+        with _config_lock:
+            _config["watch_zones"] = zones
+            _config["url_changed"] = True
+        if zones:
+            send_telegram(f"✅ 已設定篩選票區：{'、'.join(zones)}")
+        else:
+            send_telegram("✅ 已清除篩選，下一輪監控全部票區")
+
+    elif cmd == "/status":
+        zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
+        if not _config["target_url"]:
+            state_label = "🟡 待機（未設定網址）"
+        elif _config["paused"]:
+            state_label = "⏸ 已暫停"
+        else:
+            state_label = "▶️ 監控中"
+        send_telegram(
+            f"📊 <b>目前狀態</b>\n\n"
+            f"狀態：{state_label}\n"
+            f"場次：{_event_label()}\n"
+            f"篩選票區：{zones_label}\n"
+            f"最後檢查：{_status['last_check']}\n"
+            f"追蹤票區數：{_status['zones']}\n\n"
+            f"🔗 {_url_label()}"
+        )
+
+    elif cmd == "/pause":
+        _config["paused"] = True
+        send_telegram("⏸ 監控已暫停，發送 /resume 繼續")
+
+    elif cmd == "/resume":
+        _config["paused"] = False
+        send_telegram("▶️ 監控已繼續")
+
+    else:
+        send_telegram(f"未知指令：{cmd}\n\n{_HELP}")
+
+
+def _handle_update_safe(update: dict) -> None:
+    try:
+        _handle_update(update)
+    except Exception as e:
+        print(f"[BOT] 指令處理錯誤：{e}")
+
+
+def telegram_command_thread() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    offset = 0
+    print("[BOT] 開始接收 Telegram 指令")
+    while True:
+        try:
+            resp = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 30, "offset": offset, "allowed_updates": ["message"]},
+                timeout=35,
+            )
+            if resp.ok:
+                for update in resp.json().get("result", []):
+                    offset = update["update_id"] + 1
+                    # Run each update in its own thread so /check (which can
+                    # block 30–90s on Playwright) does not stall the long-poll.
+                    threading.Thread(
+                        target=_handle_update_safe, args=(update,), daemon=True
+                    ).start()
+        except Exception as e:
+            print(f"[BOT] 輪詢錯誤：{e}")
+            time.sleep(5)
+
+
+# ---------------------------------------------------------------------------
+# Main monitor loop
 # ---------------------------------------------------------------------------
 
 def main() -> None:
     zones_label = "、".join(_config["watch_zones"]) if _config["watch_zones"] else "全部"
-    print(f"[監控啟動] {_config['event_name']}")
-    print(f"[目標 URL] {_config['target_url']}")
+    print(f"[監控啟動] {_event_label()}")
+    print(f"[目標 URL] {_url_label()}")
     print(f"[篩選票區] {zones_label}")
     print(f"[檢查間隔] 每 {CHECK_INTERVAL} 秒")
     print("-" * 60)
@@ -332,29 +419,55 @@ def main() -> None:
         print("[警告] 未設定 TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID，不會發送通知")
         print("-" * 60)
 
-    send_telegram(
-        f"✅ <b>票券監控已啟動</b>\n\n"
-        f"場次：{_config['event_name']}\n"
-        f"篩選票區：{zones_label}\n"
-        f"檢查間隔：每 {CHECK_INTERVAL} 秒\n\n"
-        f"🔗 {_config['target_url']}\n\n"
-        f"發送 /help 查看可用指令"
-    )
+    if _config["target_url"]:
+        send_telegram(
+            f"✅ <b>票券監控已啟動</b>\n\n"
+            f"場次：{_event_label()}\n"
+            f"篩選票區：{zones_label}\n"
+            f"檢查間隔：每 {CHECK_INTERVAL} 秒\n\n"
+            f"🔗 {_config['target_url']}\n\n"
+            f"發送 /help 查看可用指令"
+        )
+    else:
+        send_telegram(
+            "🟡 <b>票券監控待機中</b>\n\n"
+            "尚未設定監控網址，請先發送：\n"
+            "<code>/seturl 網址</code>\n\n"
+            "發送 /help 查看所有指令"
+        )
 
     zone_status: dict[str, bool | None] = {}
     last_url = _config["target_url"]
     last_ping = 0.0
+    notified_idle = False
 
     while True:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        if _config["url_changed"] or _config["target_url"] != last_url:
+        # Snapshot config under lock so all reads within this iteration agree.
+        with _config_lock:
+            target_url = _config["target_url"]
+            current_zones = list(_config["watch_zones"])
+            paused = _config["paused"]
+            url_changed = _config["url_changed"]
+            event_name = _config["event_name"] or "未設定"
+            if url_changed:
+                _config["url_changed"] = False
+
+        if url_changed or target_url != last_url:
             zone_status.clear()
-            last_url = _config["target_url"]
-            _config["url_changed"] = False
+            last_url = target_url
+            notified_idle = False
             print(f"[{now}] 設定已更新，重設票區追蹤狀態")
 
-        if _config["paused"]:
+        if not target_url:
+            if not notified_idle:
+                print(f"[{now}] 待機中：尚未設定監控網址")
+                notified_idle = True
+            time.sleep(CHECK_INTERVAL)
+            continue
+
+        if paused:
             time.sleep(CHECK_INTERVAL)
             continue
 
@@ -363,7 +476,7 @@ def main() -> None:
             last_ping = time.time()
 
         try:
-            zones = check_page(_config["target_url"])
+            zones = check_page(target_url)
 
             if not zones:
                 print(f"[{now}] [WARN] 未解析到票區資料，請確認網址是否正確。")
@@ -373,9 +486,7 @@ def main() -> None:
             _status["last_check"] = now
             _status["zones"] = len(zones)
 
-            current_zones = _config["watch_zones"]
-            event_name = _config["event_name"]
-            current_url = _config["target_url"]
+            current_url = target_url
 
             newly_available: list[dict] = []
             already_available: list[dict] = []
@@ -430,5 +541,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     threading.Thread(target=start_web_server, daemon=True).start()
+    threading.Thread(target=_scraper_worker, daemon=True).start()
     threading.Thread(target=telegram_command_thread, daemon=True).start()
     main()

@@ -34,6 +34,16 @@ SOLD_OUT_KEYWORDS = ("已售完", "完售", "售完")
 ON_SALE_KEYWORDS = ("熱賣中", "立即購票", "購票")
 HEADER_KEYWORDS = ("票區", "空位", "區域", "座位", "票種", "類型")
 
+# Seat-selection deep links live in the seat-map fragment, not the main table.
+# Each <area> carries Send(page, performance_id, area_id, group_id, remaining);
+# the matching table row exposes the same id via its `rel` attribute.
+_SEND_RE = re.compile(
+    r"Send\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*\)"
+)
+_MAP_URL_RE = re.compile(r"""\$\(['"]#mapdata['"]\)\.load\(['"]([^'"]+)['"]""")
+_seat_link_cache: dict[str, dict[str, str]] = {}
+_seat_link_cache_lock = threading.Lock()
+
 # ---------------------------------------------------------------------------
 # Runtime config — list of monitors, mutated by Telegram commands
 # ---------------------------------------------------------------------------
@@ -178,9 +188,55 @@ def self_ping() -> None:
 # Logic ported from /Users/linzhanhu/清票監控/scrapers/utiki.py.
 # ---------------------------------------------------------------------------
 
-def _parse_zones(html: str) -> list[dict]:
+def _build_seat_links(page_html: str, base_url: str) -> dict[str, str]:
+    """Map a table row's `rel` id (e.g. 'a288') to its direct seat-selection URL.
+
+    Source is the seat-map fragment referenced by $('#mapdata').load(...). Each
+    <area> there carries a Send(...) call with the parameters the site itself
+    uses to navigate. These params are static per zone, so results are cached
+    by the (version-stamped) fragment URL.
+    """
+    m = _MAP_URL_RE.search(page_html)
+    if not m:
+        return {}
+    map_url = m.group(1)
+
+    with _seat_link_cache_lock:
+        cached = _seat_link_cache.get(map_url)
+    if cached is not None:
+        return cached
+
+    try:
+        resp = _session.get(map_url, timeout=20)
+        if resp.status_code != 200:
+            return {}
+        map_html = resp.text
+    except Exception:
+        return {}
+
+    origin = "/".join(base_url.split("/")[:3]) if "://" in base_url else ""
+    links: dict[str, str] = {}
+    soup = BeautifulSoup(map_html, "lxml")
+    for area in soup.find_all("area"):
+        area_id = area.get("id") or ""
+        sm = _SEND_RE.search(area.get("href") or "")
+        if not area_id or not sm:
+            continue
+        page, perf, area_param, group, _remaining = sm.groups()
+        links[area_id] = (
+            f"{origin}/UTK{page}_?PERFORMANCE_ID={perf}"
+            f"&GROUP_ID={group}&PERFORMANCE_PRICE_AREA_ID={area_param}"
+        )
+
+    with _seat_link_cache_lock:
+        _seat_link_cache[map_url] = links
+    return links
+
+
+def _parse_zones(html: str, seat_links: dict[str, str] | None = None) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     zones: list[dict] = []
+    seat_links = seat_links or {}
 
     for row in soup.select("table tr"):
         cells = row.find_all(["td", "th"])
@@ -228,6 +284,7 @@ def _parse_zones(html: str) -> list[dict]:
             "price": price or "—",
             "status": status,
             "available": available,
+            "url": seat_links.get(row.get("rel") or ""),
         })
 
     return zones
@@ -239,7 +296,12 @@ def check_page(url: str) -> list[dict]:
     resp = _session.get(url, headers={k: v for k, v in headers.items() if v}, timeout=20)
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}")
-    return _parse_zones(resp.text)
+    seat_links = _build_seat_links(resp.text, url)
+    return _parse_zones(resp.text, seat_links)
+
+
+def _zone_link(zone: dict, fallback_url: str) -> str:
+    return zone.get("url") or fallback_url
 
 
 # ---------------------------------------------------------------------------
@@ -321,19 +383,21 @@ def _check_one(monitor: dict) -> None:
 
     lines = []
     for z in filtered[:30]:
-        icon = "✅" if z["available"] else "❌"
-        lines.append(f"{icon} {z['name']}（NT${z['price']}）")
+        if z["available"]:
+            lines.append(f"✅ <a href='{_zone_link(z, url)}'>{z['name']}</a>（NT${z['price']}）")
+        else:
+            lines.append(f"❌ {z['name']}（NT${z['price']}）")
     if len(filtered) > 30:
         lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    purchase_link = f"\n🔗 <a href='{url}'>立即前往購票</a>" if available_count > 0 else ""
+    purchase_hint = "\n👆 點有票票區名稱直達選位頁" if available_count > 0 else ""
     send_telegram(
         f"📋 <b>即時票況｜{event_name}</b>\n\n"
         + "\n".join(lines)
         + f"\n\n✅ 有票：{available_count}　❌ 售完：{sold_out_count}\n"
         f"⏰ {now}"
-        + purchase_link
+        + purchase_hint
     )
 
 
@@ -686,25 +750,27 @@ def _check_monitor_once(monitor: dict, now: str) -> None:
 
         if already_available:
             lines = "\n".join(
-                f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                f"• <a href='{_zone_link(z, target_url)}'>{z['name']}</a>"
+                f"（NT${z['price']}，剩餘：{z['status']}）"
                 for z in already_available
             )
             send_telegram(
                 f"ℹ️ <b>啟動時即有票的票區</b>\n\n"
                 f"<b>{event_name}</b>\n\n{lines}\n\n"
-                f"🔗 <a href='{target_url}'>立即前往購票</a>"
+                f"👆 點票區名稱直達選位頁"
             )
 
         if newly_available:
             lines = "\n".join(
-                f"• {z['name']}（NT${z['price']}，剩餘：{z['status']}）"
+                f"• <a href='{_zone_link(z, target_url)}'>{z['name']}</a>"
+                f"（NT${z['price']}，剩餘：{z['status']}）"
                 for z in newly_available
             )
             send_telegram(
                 f"🎫 <b>票券釋出通知！</b>\n\n"
                 f"<b>{event_name}</b>\n\n"
                 f"以下票區有票可購買：\n{lines}\n\n"
-                f"🔗 <a href='{target_url}'>立即前往購票</a>\n\n"
+                f"👆 點票區名稱直達選位頁\n\n"
                 f"⏰ 偵測時間：{now}"
             )
             print(f"[{now}] [{event_name}] Telegram 通知已發送（{len(newly_available)} 個票區）")

@@ -8,6 +8,7 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urljoin
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -37,10 +38,12 @@ HEADER_KEYWORDS = ("票區", "空位", "區域", "座位", "票種", "類型")
 # Seat-selection deep links live in the seat-map fragment, not the main table.
 # Each <area> carries Send(page, performance_id, area_id, group_id, remaining);
 # the matching table row exposes the same id via its `rel` attribute.
+# Both single- and double-quoted JS args are accepted.
 _SEND_RE = re.compile(
-    r"Send\(\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*,\s*'([^']*)'\s*\)"
+    r"""Send\(\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]\s*,\s*['"]([^'"]*)['"]\s*\)"""
 )
-_MAP_URL_RE = re.compile(r"""\$\(['"]#mapdata['"]\)\.load\(['"]([^'"]+)['"]""")
+# Allow optional whitespace inside $() and support both quote styles.
+_MAP_URL_RE = re.compile(r"""\$\(\s*['"]#mapdata['"]\s*\)\.load\(\s*['"]([^'"]+)['"]""")
 _seat_link_cache: dict[str, dict[str, str]] = {}
 _seat_link_cache_lock = threading.Lock()
 
@@ -199,7 +202,8 @@ def _build_seat_links(page_html: str, base_url: str) -> dict[str, str]:
     m = _MAP_URL_RE.search(page_html)
     if not m:
         return {}
-    map_url = m.group(1)
+    # Resolve relative URLs against the page URL so requests.get gets a full URL.
+    map_url = urljoin(base_url, m.group(1))
 
     with _seat_link_cache_lock:
         cached = _seat_link_cache.get(map_url)
@@ -233,10 +237,11 @@ def _build_seat_links(page_html: str, base_url: str) -> dict[str, str]:
     return links
 
 
-def _parse_zones(html: str, seat_links: dict[str, str] | None = None) -> list[dict]:
+def _parse_zones(html: str, base_url: str = "", seat_links: dict[str, str] | None = None) -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
     zones: list[dict] = []
     seat_links = seat_links or {}
+    origin = "/".join(base_url.split("/")[:3]) if "://" in base_url else ""
 
     for row in soup.select("table tr"):
         cells = row.find_all(["td", "th"])
@@ -279,12 +284,27 @@ def _parse_zones(html: str, seat_links: dict[str, str] | None = None) -> list[di
             # Unknown status text — skip rather than misreport
             continue
 
+        # Primary: seat map matched by table row's `rel` id.
+        # Fallback: Send() call in the row's own onclick attribute.
+        rel = row.get("rel") or ""
+        if isinstance(rel, list):
+            rel = rel[0] if rel else ""
+        zone_url = seat_links.get(rel)
+        if not zone_url and origin:
+            sm2 = _SEND_RE.search(row.get("onclick") or "")
+            if sm2:
+                pg, pf, ap, gp, _ = sm2.groups()
+                zone_url = (
+                    f"{origin}/UTK{pg}_?PERFORMANCE_ID={pf}"
+                    f"&GROUP_ID={gp}&PERFORMANCE_PRICE_AREA_ID={ap}"
+                )
+
         zones.append({
             "name": name,
             "price": price or "—",
             "status": status,
             "available": available,
-            "url": seat_links.get(row.get("rel") or ""),
+            "url": zone_url,
         })
 
     return zones
@@ -297,7 +317,7 @@ def check_page(url: str) -> list[dict]:
     if resp.status_code != 200:
         raise RuntimeError(f"HTTP {resp.status_code}")
     seat_links = _build_seat_links(resp.text, url)
-    return _parse_zones(resp.text, seat_links)
+    return _parse_zones(resp.text, url, seat_links)
 
 
 def _zone_link(zone: dict, fallback_url: str) -> str:

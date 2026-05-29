@@ -201,6 +201,7 @@ def _build_seat_links(page_html: str, base_url: str) -> dict[str, str]:
     """
     m = _MAP_URL_RE.search(page_html)
     if not m:
+        print(f"[LINK] 找不到 #mapdata.load(...) — 深連結不可用（{base_url}）")
         return {}
     # Resolve relative URLs against the page URL so requests.get gets a full URL.
     map_url = urljoin(base_url, m.group(1))
@@ -213,9 +214,11 @@ def _build_seat_links(page_html: str, base_url: str) -> dict[str, str]:
     try:
         resp = _session.get(map_url, timeout=20)
         if resp.status_code != 200:
+            print(f"[LINK] 座位圖回傳 {resp.status_code}：{map_url}")
             return {}
         map_html = resp.text
-    except Exception:
+    except Exception as e:
+        print(f"[LINK] 座位圖請求失敗：{e}（{map_url}）")
         return {}
 
     origin = "/".join(base_url.split("/")[:3]) if "://" in base_url else ""
@@ -231,6 +234,9 @@ def _build_seat_links(page_html: str, base_url: str) -> dict[str, str]:
             f"{origin}/UTK{page}_?PERFORMANCE_ID={perf}"
             f"&GROUP_ID={group}&PERFORMANCE_PRICE_AREA_ID={area_param}"
         )
+
+    if not links:
+        print(f"[LINK] 座位圖解析完畢，但找不到任何 <area id> + Send()（{map_url}）")
 
     with _seat_link_cache_lock:
         _seat_link_cache[map_url] = links
@@ -298,6 +304,14 @@ def _parse_zones(html: str, base_url: str = "", seat_links: dict[str, str] | Non
                     f"{origin}/UTK{pg}_?PERFORMANCE_ID={pf}"
                     f"&GROUP_ID={gp}&PERFORMANCE_PRICE_AREA_ID={ap}"
                 )
+        # Last-resort: look for a direct UTK href inside any cell of this row.
+        if not zone_url:
+            for cell in cells:
+                a = cell.find("a", href=True)
+                if a and "/UTK" in (a["href"] or ""):
+                    href = a["href"]
+                    zone_url = urljoin(base_url, href) if not href.startswith("http") else href
+                    break
 
         zones.append({
             "name": name,
@@ -318,6 +332,16 @@ def check_page(url: str) -> list[dict]:
         raise RuntimeError(f"HTTP {resp.status_code}")
     seat_links = _build_seat_links(resp.text, url)
     return _parse_zones(resp.text, url, seat_links)
+
+
+def _avail_count(zone: dict) -> int:
+    """0=售完，-1=有票但無數字（熱賣中），N=剩N張。"""
+    if not zone["available"]:
+        return 0
+    try:
+        return max(1, int(zone["status"]))
+    except (ValueError, TypeError):
+        return -1
 
 
 def _zone_link(zone: dict, fallback_url: str) -> str:
@@ -411,7 +435,13 @@ def _check_one(monitor: dict) -> None:
         lines.append(f"⋯ 共 {len(filtered)} 個票區（只顯示前 30）")
 
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    purchase_hint = "\n👆 點有票票區名稱直達選位頁" if available_count > 0 else ""
+    has_deep_links = any(z.get("url") for z in filtered)
+    if available_count > 0 and has_deep_links:
+        purchase_hint = "\n👆 點有票票區名稱直達選位頁"
+    elif available_count > 0:
+        purchase_hint = "\n⚠️ 無法取得直達連結，請確認網址是否為具體場次頁（非選場頁）"
+    else:
+        purchase_hint = ""
     send_telegram(
         f"📋 <b>即時票況｜{event_name}</b>\n\n"
         + "\n".join(lines)
@@ -750,6 +780,7 @@ def _check_monitor_once(monitor: dict, now: str) -> None:
 
         newly_available: list[dict] = []
         already_available: list[dict] = []
+        count_increased: list[tuple[dict, int, int]] = []
 
         for zone in zones:
             name = zone["name"]
@@ -757,16 +788,24 @@ def _check_monitor_once(monitor: dict, now: str) -> None:
                 continue
 
             avail = zone["available"]
-            prev = zone_status.get(name)
+            curr_count = _avail_count(zone)
+            prev_count = zone_status.get(name)  # int or None
             status_label = f"✅ 有票（剩 {zone['status']}）" if avail else "❌ 售完"
             print(f"[{now}] [{event_name}] {name} ｜ NT${zone['price']} ｜ {status_label}")
 
-            if prev is None and avail:
-                already_available.append(zone)
-            elif prev is not None and not prev and avail:
-                newly_available.append(zone)
+            if prev_count is None:
+                if avail:
+                    already_available.append(zone)
+            else:
+                prev_avail = prev_count != 0
+                if not prev_avail and avail:
+                    # 售完 → 有票
+                    newly_available.append(zone)
+                elif prev_avail and avail and prev_count > 0 and curr_count > prev_count:
+                    # 票數增加（例如鎖定席位釋出）
+                    count_increased.append((zone, prev_count, curr_count))
 
-            zone_status[name] = avail
+            zone_status[name] = curr_count
 
         if already_available:
             lines = "\n".join(
@@ -794,6 +833,21 @@ def _check_monitor_once(monitor: dict, now: str) -> None:
                 f"⏰ 偵測時間：{now}"
             )
             print(f"[{now}] [{event_name}] Telegram 通知已發送（{len(newly_available)} 個票區）")
+
+        if count_increased:
+            lines = "\n".join(
+                f"• <a href='{_zone_link(z, target_url)}'>{z['name']}</a>"
+                f"（NT${z['price']}，{prev}→{curr} 張）"
+                for z, prev, curr in count_increased
+            )
+            send_telegram(
+                f"📈 <b>票數增加通知！</b>\n\n"
+                f"<b>{event_name}</b>\n\n"
+                f"以下票區釋出更多席位：\n{lines}\n\n"
+                f"👆 點票區名稱直達選位頁\n\n"
+                f"⏰ 偵測時間：{now}"
+            )
+            print(f"[{now}] [{event_name}] 票數增加通知已發送（{len(count_increased)} 個票區）")
 
     except Exception as e:
         print(f"[{now}] [{event_name}] [ERROR] {e}")
